@@ -88,6 +88,16 @@ func start(ctx context.Context, root string, j *Journal) (func(), error) {
 				isDir := ev.Mask&unix.IN_ISDIR != 0
 				if isDir && ev.Mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0 {
 					add(p)
+					// Entries created before the watch was added produced no
+					// events: report what is already there.
+					filepath.WalkDir(p, func(fp string, d os.DirEntry, err error) error {
+						if err == nil && fp != p {
+							if r, err := filepath.Rel(root, fp); err == nil {
+								j.Record(r, d.IsDir())
+							}
+						}
+						return nil
+					})
 				}
 				j.Record(rel, isDir && ev.Mask&(unix.IN_CREATE|unix.IN_DELETE|unix.IN_MOVED_FROM|unix.IN_MOVED_TO) != 0)
 			}

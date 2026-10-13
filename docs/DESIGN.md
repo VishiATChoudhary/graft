@@ -19,7 +19,7 @@ implements it, and records where graft deliberately differs.
 | **Source control as a service.** Every query the client uses is also an API, so many jobs need no local repository. | `internal/api` exposes log, blame, diff (with `mergebase=`), merge-base, is-ancestor, ls, cat, search, write, rebase, merge, land as HTTP/JSON. `gft write` commits without a checkout. |
 | **Everything horizontally scalable.** No fully materialized repo anywhere, no packfiles, no repository maintenance. | Objects are content-addressed and immutable; every tier is a cache that needs no coordination. Objects are compressed individually (zstd); there is no packing, repacking or gc anywhere. |
 | **Commits are cheap, incremental and lock-free.** Every commit, rebase and merge happens on the server; cost scales with the change, not the repo. Refs are discouraged and moved by compare-and-swap. | `repo.Create` touches only the changed paths (`applyTree`, `applyUnode` are O(changes x depth)). Rebase examines only the paths a changeset touched. `repo.Land` rebases server-side and moves the ref with a CAS on a single row (a per-ref mutex around one key; no global lock). |
-| **The working copy is optional and sparse by design.** | `gft clone --sparse`, `gft sparse add/set`, and `gft mount` (virtualized, read-only checkout that fetches on first read). CI questions use the API and skip the checkout entirely. |
+| **The working copy is optional and sparse by design.** | `gft clone --sparse`, `gft sparse add/set`, and `gft mount` (virtualized, writable checkout that fetches on first read). CI questions use the API and skip the checkout entirely. |
 
 ## Data structures
 

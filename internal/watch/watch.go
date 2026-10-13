@@ -211,6 +211,11 @@ func Run(ctx context.Context, root string) error {
 		return err
 	}
 	j := NewJournal()
+	// The cookie directory must exist before watching starts (inotify only
+	// sees files in directories it already watches).
+	if err := os.MkdirAll(filepath.Join(root, ".gft", "cookies"), 0o755); err != nil {
+		return err
+	}
 	stop, err := start(ctx, root, j)
 	if err != nil {
 		return err
