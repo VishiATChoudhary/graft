@@ -73,7 +73,7 @@ const (
 	maxDeltaDepth     = 128
 	maxBlobDeltaDepth = 64
 
-	maxChainRead      = 1 << 14
+	maxChainRead = 1 << 14
 
 	dictSamples = 2000
 
