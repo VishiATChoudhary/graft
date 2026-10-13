@@ -1,0 +1,5 @@
+/bin/
+/bench/out/
+/bench/work/
+*.gfts
+.gft/
