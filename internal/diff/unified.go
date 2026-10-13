@@ -62,7 +62,7 @@ func Unified(w io.Writer, nameA, nameB string, a, b []byte, context int) {
 				end++
 			}
 			run := end
-			for run < len(ops) && ops[run].kind == ' ' && run-end < 2*context+1 {
+			for run < len(ops) && ops[run].kind == ' ' && run-end < 2*context {
 				run++
 			}
 			if run < len(ops) && ops[run].kind != ' ' {
@@ -91,7 +91,7 @@ func Unified(w io.Writer, nameA, nameB string, a, b []byte, context int) {
 		if nb == 0 {
 			sb--
 		}
-		fmt.Fprintf(w, "@@ -%d,%d +%d,%d @@\n", sa, na, sb, nb)
+		fmt.Fprintf(w, "@@ -%s +%s @@%s\n", hunkRange(sa, na), hunkRange(sb, nb), funcContext(A, aLine[start]))
 		for _, o := range ops[start:end] {
 			w.Write([]byte{o.kind})
 			w.Write(o.line)
@@ -101,4 +101,32 @@ func Unified(w io.Writer, nameA, nameB string, a, b []byte, context int) {
 		}
 		i = end
 	}
+}
+
+// funcContext mimics git's default hunk-header context: the nearest line
+// before the hunk that starts with a letter, '_' or '$', cut to 80 bytes
+// with trailing whitespace removed.
+func funcContext(lines [][]byte, start int) string {
+	for i := min(start, len(lines)) - 1; i >= 0; i-- {
+		l := lines[i]
+		if len(l) == 0 {
+			continue
+		}
+		c := l[0]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == '$' {
+			if len(l) > 80 {
+				l = l[:80]
+			}
+			return " " + string(bytes.TrimRight(l, " \t\r\n\v\f"))
+		}
+	}
+	return ""
+}
+
+// hunkRange formats "start,count", omitting a count of one as git does.
+func hunkRange(start, n int) string {
+	if n == 1 {
+		return fmt.Sprint(start)
+	}
+	return fmt.Sprintf("%d,%d", start, n)
 }

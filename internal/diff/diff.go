@@ -45,6 +45,16 @@ func Lines(a, b [][]byte) []Match {
 	ids := make(map[string]int, len(a)+len(b))
 	ai := intern(a, ids)
 	bi := intern(b, ids)
+	ca, cb := xdiff(ai, bi)
+	return compactChanges(ai, bi, a, b, ca, cb)
+}
+
+// MinimalLines computes a minimal diff (linear-space Myers). It is used
+// where minimality matters more than matching git's choices.
+func MinimalLines(a, b [][]byte) []Match {
+	ids := make(map[string]int, len(a)+len(b))
+	ai := intern(a, ids)
+	bi := intern(b, ids)
 	var out []Match
 	rec(ai, bi, 0, 0, &out)
 	return coalesce(out)

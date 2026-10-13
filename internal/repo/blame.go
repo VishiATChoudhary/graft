@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/VishiATChoudhary/graft/internal/diff"
@@ -156,6 +157,16 @@ func (r *Repo) computeBlame(k object.ID, parents []object.ID, vals [][]byte) ([]
 		attr[i] = blameRun{1, link, i}
 	}
 	assigned := make([]bool, len(lines))
+	// Like git: a parent with identical content takes the whole blame.
+	for pi, p := range parents {
+		pp, pl, err := r.versionOf(p)
+		if err != nil {
+			return nil, err
+		}
+		if pc, err := r.versionContent(pp, pl); err == nil && bytes.Equal(pc, content) {
+			return vals[pi], nil
+		}
+	}
 	for pi, p := range parents {
 		pp, pl, err := r.versionOf(p)
 		if err != nil {
