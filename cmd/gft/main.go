@@ -39,6 +39,8 @@ Working copy:
   gft diff [path...]                 local modifications as a patch
   gft commit -m <msg> [path...]      create a changeset on the server (nothing to push)
   gft land [--ref main]              rebase server-side if needed, then CAS the ref
+  gft review [rev] [--ref main]      which approvals a change needs (comment-only/docs changes can be exempt)
+  gft approve <rev>                  approve a change
   gft rebase <onto>                  rebase the current changeset server-side
 
 Repository queries (served by the server; no local history needed):
@@ -127,6 +129,10 @@ func main() {
 		err = cmdFind(args)
 	case "grep":
 		err = cmdGrep(args)
+	case "approve":
+		err = cmdApprove(args)
+	case "review":
+		err = cmdReview(args)
 	case "refs":
 		err = cmdRefs(args)
 	case "write":
@@ -928,6 +934,61 @@ func cmdGrep(args []string) error {
 	if res.Truncated {
 		fmt.Fprintf(w, "(stopped after %d matches)\n", len(res.Matches))
 	}
+	return nil
+}
+
+func printReview(st *api.ReviewStatus) {
+	state := "ready to land"
+	if !st.Satisfied {
+		state = "needs review"
+	}
+	fmt.Printf("%s: %s\n", st.Changeset.Short(), state)
+	for _, r := range st.Rules {
+		mark := "ok"
+		if !r.Satisfied {
+			mark = "MISSING"
+		}
+		fmt.Printf("  %-24s %d/%d approvals %-8s %s\n", r.Path+"/", len(r.Approvals), r.Required, mark, strings.Join(r.Approvals, ", "))
+		for _, f := range r.Files {
+			fmt.Printf("      needs review: %s\n", f)
+		}
+		for _, f := range r.Exempted {
+			fmt.Printf("      exempt:       %s\n", f)
+		}
+	}
+}
+
+func cmdApprove(args []string) error {
+	fs := flag.NewFlagSet("approve", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	pos := parse(fs, args)
+	if len(pos) != 1 {
+		return errors.New("usage: gft approve <rev>")
+	}
+	c, wt := apiClient(*server)
+	st, err := c.Approve(bg(), revOr(pos[0], wt))
+	if err != nil {
+		return err
+	}
+	printReview(st)
+	return nil
+}
+
+func cmdReview(args []string) error {
+	fs := flag.NewFlagSet("review", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	ref := fs.String("ref", "main", "ref the change would land on")
+	pos := parse(fs, args)
+	c, wt := apiClient(*server)
+	rev := ""
+	if len(pos) > 0 {
+		rev = pos[0]
+	}
+	st, err := c.ReviewStatus(bg(), revOr(rev, wt), *ref)
+	if err != nil {
+		return err
+	}
+	printReview(st)
 	return nil
 }
 

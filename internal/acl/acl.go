@@ -70,6 +70,47 @@ type Policy struct {
 	Roles     map[string]Role     `json:"roles"`   // per-principal or "group:x" overrides
 	Admins    []string            `json:"admins"`
 	Rules     []Rule              `json:"rules"`
+	// Reviews require approvals before changes under a path can land.
+	Reviews []ReviewRule `json:"reviews"`
+}
+
+// ReviewRule requires Approvals approvals from Approvers (principals or
+// "group:x") for changes under Path, except changes whose class is listed
+// in Exempt ("comments", "whitespace", "docs").
+type ReviewRule struct {
+	Path      string   `json:"path"`
+	Approvals int      `json:"approvals"`
+	Approvers []string `json:"approvers"`
+	Exempt    []string `json:"exempt,omitempty"`
+}
+
+// ReviewRuleFor returns the most specific review rule covering path.
+func (p *Policy) ReviewRuleFor(path string) *ReviewRule {
+	path = strings.Trim(path, "/")
+	for i := range p.Reviews {
+		if under(path, p.Reviews[i].Path) {
+			return &p.Reviews[i]
+		}
+	}
+	return nil
+}
+
+// CanApprove reports whether pr may approve under rule.
+func (p *Policy) CanApprove(pr *Principal, rule *ReviewRule) bool {
+	return pr.Name != "" && pr.matches(rule.Approvers)
+}
+
+// PrincipalByName builds a principal (with groups) for a known name.
+func (p *Policy) PrincipalByName(name string) *Principal {
+	pr := &Principal{Name: name, groups: map[string]bool{}}
+	for g, members := range p.Groups {
+		for _, m := range members {
+			if m == name || m == "*" {
+				pr.groups[g] = true
+			}
+		}
+	}
+	return pr
 }
 
 // Load reads a policy file.
@@ -95,6 +136,10 @@ func (p *Policy) normalize() *Policy {
 	for i := range p.Rules {
 		p.Rules[i].Path = strings.Trim(p.Rules[i].Path, "/")
 	}
+	for i := range p.Reviews {
+		p.Reviews[i].Path = strings.Trim(p.Reviews[i].Path, "/")
+	}
+	sort.SliceStable(p.Reviews, func(i, j int) bool { return len(p.Reviews[i].Path) > len(p.Reviews[j].Path) })
 	// Longest paths first, so the first match is the most specific.
 	sort.SliceStable(p.Rules, func(i, j int) bool { return len(p.Rules[i].Path) > len(p.Rules[j].Path) })
 	return p

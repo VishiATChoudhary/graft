@@ -132,6 +132,29 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/cat", s.raw(s.cat, "read"))
 	mux.HandleFunc("/v1/search", s.wrap(s.search))
 	mux.HandleFunc("/v1/grep", s.wrap(s.grep))
+	mux.HandleFunc("/v1/reviews/approve", s.wrap(s.approveHandler))
+	mux.HandleFunc("/v1/reviews/status", s.wrap(s.reviewStatusHandler))
+}
+
+func (s *Server) approveHandler(r *http.Request) (any, error) {
+	var req struct{ ID string }
+	if err := decodeJSON(r, &req); err != nil {
+		return nil, err
+	}
+	return s.approve(r.Context(), req.ID)
+}
+
+func (s *Server) reviewStatusHandler(r *http.Request) (any, error) {
+	id, err := s.rev(r, "id", "")
+	if err != nil {
+		return nil, err
+	}
+	ref := r.URL.Query().Get("ref")
+	if ref == "" {
+		ref = "main"
+	}
+	tip, _ := s.Repo.Ref(ref)
+	return s.reviewStatus(id, tip)
 }
 
 // GrepResult is the response of /v1/grep.
@@ -322,6 +345,10 @@ func (s *Server) refUpdate(r *http.Request) (any, error) {
 		}
 	} else if err := s.checkRefMove(r.Context())(u.Old, u.New); err != nil {
 		return nil, err
+	} else if !strings.HasPrefix(u.Name, "reviews/") {
+		if err := s.requireReviews(u.New, u.Old); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.Repo.UpdateRef(u.Name, u.Old, u.New); err != nil {
 		return nil, err
@@ -363,6 +390,7 @@ func (s *Server) create(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.recordCreator(r.Context(), id)
 	root, err := s.Repo.RootTree(id)
 	if err != nil {
 		return nil, err
@@ -405,8 +433,13 @@ func (s *Server) write(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.recordCreator(r.Context(), id)
 	resp := &WriteResponse{ID: id}
 	if req.Land != "" {
+		tip, _ := s.Repo.Ref(req.Land)
+		if err := s.requireReviews(id, tip); err != nil {
+			return nil, err
+		}
 		if resp.Land, err = s.Repo.Land(req.Land, id, req.Author, cs.Time, 0, s.checkRefMove(r.Context())); err != nil {
 			return nil, err
 		}
@@ -656,6 +689,10 @@ func (s *Server) land(r *http.Request) (any, error) {
 	}
 	id, err := s.Repo.Resolve(req.ID)
 	if err != nil {
+		return nil, err
+	}
+	tip, _ := s.Repo.Ref(req.Ref)
+	if err := s.requireReviews(id, tip); err != nil {
 		return nil, err
 	}
 	return s.Repo.Land(req.Ref, id, req.Author, time.Now().Unix(), 0, s.checkRefMove(r.Context()))

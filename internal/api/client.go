@@ -236,6 +236,16 @@ func (c *Client) Grep(ctx context.Context, rev, pattern, dir string, fixed, igno
 	return &out, c.do(ctx, "GET", "/v1/grep", q, nil, &out)
 }
 
+func (c *Client) Approve(ctx context.Context, rev string) (*ReviewStatus, error) {
+	var out ReviewStatus
+	return &out, c.do(ctx, "POST", "/v1/reviews/approve", nil, map[string]string{"id": rev}, &out)
+}
+
+func (c *Client) ReviewStatus(ctx context.Context, rev, ref string) (*ReviewStatus, error) {
+	var out ReviewStatus
+	return &out, c.do(ctx, "GET", "/v1/reviews/status", url.Values{"id": {rev}, "ref": {ref}}, nil, &out)
+}
+
 func (c *Client) Info(ctx context.Context) (map[string]any, error) {
 	var out map[string]any
 	return out, c.do(ctx, "GET", "/v1/info", nil, nil, &out)
