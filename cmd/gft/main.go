@@ -52,7 +52,9 @@ Repository queries (served by the server; no local history needed):
   gft write --parent R [--land REF] -m <msg> path=@file|path=-delete ...   commit without a checkout
 
 Infrastructure:
-  gft serve --tier server --data <dir> [--listen addr]
+  gft serve --tier server --data <dir> [--listen addr]                      single node
+  gft serve --tier store  --data <dir> --nodes <u0,u1,..> --shard <i>        storage shard
+  gft serve --tier server --store <u0,u1,..> [--listen addr]                stateless API server
   gft serve --tier cache  --upstream <server> [--mem 8G] [--listen addr]
   gft serve --tier daemon --upstream <cache> [--listen unix:///run/gft.sock] [--disk 20G] [--seed file]
   gft snapshot --server <url> --rev main --out <file>
@@ -243,12 +245,25 @@ func revOr(rev string, wt *client.Worktree) string {
 func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	data := fs.String("data", "", "server data directory (server must be stopped)")
+	storeNodes := fs.String("store", "", "import into a storage fleet instead (comma-separated node URLs)")
 	gitDir := fs.String("git", ".", "git repository")
 	var refs multi
 	fs.Var(&refs, "ref", "git ref to import (repeatable; default HEAD -> main)")
 	parse(fs, args)
+	if *storeNodes != "" {
+		r, err := repo.Open(store.NewSharded(strings.Split(*storeNodes, ","), 1<<30))
+		if err != nil {
+			return err
+		}
+		st, err := gitimport.Import(bg(), r, gitimport.Options{GitDir: *gitDir, Refs: refs, RefMap: map[string]string{"HEAD": "main"}})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("imported %d changesets, %d blobs into %d shards in %s\n", st.Changesets, st.Blobs, len(strings.Split(*storeNodes, ",")), st.Elapsed.Round(time.Millisecond))
+		return nil
+	}
 	if *data == "" {
-		return errors.New("--data is required")
+		return errors.New("--data or --store is required")
 	}
 	db, err := store.OpenDB(*data, 1<<30)
 	if err != nil {

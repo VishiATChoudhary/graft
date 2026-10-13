@@ -25,7 +25,6 @@ type Repo struct {
 	cs    *derive.Type // changeset -> root tree, history root, commit graph (one record)
 	blame *derive.Type // file version -> blame runs (lazy)
 	nodes nodeCache
-
 }
 
 var (
@@ -74,8 +73,10 @@ func (r *Repo) Create(cs *object.Changeset) (object.ID, error) {
 		return object.Zero, fmt.Errorf("%w: %v", ErrBadChange, err)
 	}
 	for _, p := range cs.Parents {
-		if _, err := r.DB.LogSeq(p); err != nil {
+		if _, err := r.DB.LogSeq(p); errors.Is(err, object.ErrNotFound) {
 			return object.Zero, fmt.Errorf("%w: parent %s", ErrBadRev, p.Short())
+		} else if err != nil {
+			return object.Zero, err
 		}
 	}
 	for _, ch := range cs.Changes {
@@ -135,8 +136,10 @@ func (r *Repo) UpdateRef(name string, old, new object.ID) error {
 		return err
 	}
 	if !new.IsZero() {
-		if _, err := r.DB.LogSeq(new); err != nil {
+		if _, err := r.DB.LogSeq(new); errors.Is(err, object.ErrNotFound) {
 			return fmt.Errorf("%w: %s", ErrBadRev, new.Short())
+		} else if err != nil {
+			return err
 		}
 	}
 	err := r.DB.CASRef(name, old, new)
@@ -194,6 +197,8 @@ func (r *Repo) Resolve(rev string) (object.ID, error) {
 func (r *Repo) resolveBase(rev string) (object.ID, error) {
 	if id, err := r.DB.GetRef(rev); err == nil {
 		return id, nil
+	} else if !errors.Is(err, object.ErrNotFound) {
+		return object.Zero, err
 	}
 	if len(rev) == 64 {
 		id, err := object.ParseID(rev)

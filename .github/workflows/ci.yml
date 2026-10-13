@@ -17,6 +17,8 @@ jobs:
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
       - run: go test -race ./...
+      - name: repository tests against a 3-shard storage fleet
+        run: GRAFT_TEST_SHARDS=3 go test -race ./internal/repo/
       - run: go build -o bin/gft ./cmd/gft
       - name: smoke test against git
         run: bench/smoke.sh

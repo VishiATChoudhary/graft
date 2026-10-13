@@ -3,6 +3,9 @@ package repo
 import (
 	"errors"
 	"fmt"
+	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,16 +16,60 @@ import (
 
 func newRepo(t *testing.T) *Repo {
 	t.Helper()
+	r, err := Open(newBackend(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// newBackend returns a local DB, or a sharded fleet when GRAFT_TEST_SHARDS
+// is set (CI runs the suite both ways).
+func newBackend(t *testing.T) store.Backend {
+	t.Helper()
+	if n, _ := strconv.Atoi(os.Getenv("GRAFT_TEST_SHARDS")); n > 0 {
+		return newFleet(t, n)
+	}
 	db, err := store.OpenDB(t.TempDir(), 64<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	r, err := Open(db)
-	if err != nil {
-		t.Fatal(err)
+	return db
+}
+
+// newFleet starts n storage nodes and returns the shared URLs' client.
+func newFleet(t *testing.T, n int) *store.Sharded {
+	t.Helper()
+	urls := fleetURLs(t, n)
+	return store.NewSharded(urls, 64<<20)
+}
+
+func fleetURLs(t *testing.T, n int) []string {
+	t.Helper()
+	var urls []string
+	var dbs []*store.DB
+	var srvs []*httptest.Server
+	for i := 0; i < n; i++ {
+		db, err := store.OpenDB(t.TempDir(), 32<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbs = append(dbs, db)
+		srv := httptest.NewServer(store.NodeHandler(db))
+		srvs = append(srvs, srv)
+		urls = append(urls, srv.URL)
 	}
-	return r
+	for i, db := range dbs {
+		db.SetPeers(store.PeerResolver(urls, i, db))
+	}
+	t.Cleanup(func() {
+		for i := range srvs {
+			srvs[i].Close()
+			dbs[i].Close()
+		}
+	})
+	return urls
 }
 
 func blob(t *testing.T, r *Repo, s string) object.ID {
@@ -253,5 +300,64 @@ func TestConcurrentLand(t *testing.T) {
 	g, _ := r.Graph(tip)
 	if g.Depth != n {
 		t.Fatalf("linear history depth %d want %d", g.Depth, n)
+	}
+}
+
+// TestMultipleAPIServers runs several stateless API servers (each its own
+// Repo over its own Sharded client) against one storage fleet, landing
+// concurrently. No lands may be lost, and history must be linear.
+func TestMultipleAPIServers(t *testing.T) {
+	urls := fleetURLs(t, 3)
+	var servers []*Repo
+	for i := 0; i < 3; i++ {
+		r, err := Open(store.NewSharded(append([]string{}, urls...), 32<<20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers = append(servers, r)
+	}
+	base := commit(t, servers[0], nil, "base", map[string]string{"README": "hi\n"})
+	if err := servers[1].UpdateRef("main", object.Zero, base); err != nil {
+		t.Fatal(err)
+	}
+	const n = 48
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := servers[i%len(servers)]
+			id := commit(t, r, []object.ID{base}, fmt.Sprint("agent ", i), map[string]string{fmt.Sprintf("agents/%d.txt", i): fmt.Sprint(i, "\n")})
+			if _, err := r.Land("main", id, "t", 1, 1000); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	// Every server sees the same tip with all changes.
+	tip, _ := servers[2].Ref("main")
+	for _, r := range servers {
+		if got, _ := r.Ref("main"); got != tip {
+			t.Fatal("servers disagree on main")
+		}
+	}
+	for i := 0; i < n; i++ {
+		if got := read(t, servers[i%3], tip, fmt.Sprintf("agents/%d.txt", i)); got != fmt.Sprint(i, "\n") {
+			t.Fatalf("agent %d lost: %q", i, got)
+		}
+	}
+	g, _ := servers[0].Graph(tip)
+	if g.Depth != n {
+		t.Fatalf("depth %d want %d", g.Depth, n)
+	}
+	// History queries work from any server.
+	pl, err := servers[1].PathLog(tip, "agents", 0, false)
+	if err != nil || len(pl) != n {
+		t.Fatalf("path log over fleet: %d %v", len(pl), err)
 	}
 }

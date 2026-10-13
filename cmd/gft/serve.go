@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,7 +29,10 @@ import (
 
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	tier := fs.String("tier", "server", "server | cache | daemon")
+	tier := fs.String("tier", "server", "server | cache | daemon | store")
+	storeNodes := fs.String("store", "", "server: comma-separated storage nodes (stateless API server); omit to use --data")
+	shard := fs.Int("shard", 0, "store: this node's index in --nodes")
+	nodes := fs.String("nodes", "", "store: comma-separated URLs of every storage node, in shard order")
 	listen := fs.String("listen", "127.0.0.1:7070", "listen address (host:port, or unix:///path.sock)")
 	data := fs.String("data", "", "server: data directory")
 	upstream := fs.String("upstream", "", "cache/daemon: the single upstream tier (strict tiering)")
@@ -42,19 +46,45 @@ func cmdServe(args []string) error {
 	var closeFn func()
 	switch *tier {
 	case "server":
-		if *data == "" {
-			return errors.New("--data is required for the server tier")
+		var backend store.Backend
+		switch {
+		case *storeNodes != "":
+			// Stateless API server over a storage fleet; run as many as needed.
+			backend = store.NewSharded(strings.Split(*storeNodes, ","), mustSize(*mem))
+		case *data != "":
+			db, err := store.OpenDB(*data, mustSize(*mem))
+			if err != nil {
+				return err
+			}
+			closeFn = func() { db.Close() }
+			backend = db
+		default:
+			return errors.New("the server tier needs --data (single node) or --store (storage fleet)")
+		}
+		r, err := repo.Open(backend)
+		if err != nil {
+			return err
+		}
+		(&api.Server{Repo: r, Log: log.Default()}).Routes(mux)
+	case "store":
+		if *data == "" || *nodes == "" {
+			return errors.New("the store tier needs --data and --nodes (and --shard)")
+		}
+		urls := strings.Split(*nodes, ",")
+		if *shard < 0 || *shard >= len(urls) {
+			return fmt.Errorf("--shard %d out of range for %d nodes", *shard, len(urls))
 		}
 		db, err := store.OpenDB(*data, mustSize(*mem))
 		if err != nil {
 			return err
 		}
 		closeFn = func() { db.Close() }
-		r, err := repo.Open(db)
-		if err != nil {
-			return err
-		}
-		(&api.Server{Repo: r, Log: log.Default()}).Routes(mux)
+		db.SetPeers(store.PeerResolver(urls, *shard, db))
+		mux.Handle("/kv/", store.NodeHandler(db))
+		mux.HandleFunc("/v1/info", func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{"tier": "store", "shard": *shard, "shards": len(urls),
+				"cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS(), "store": db.Stats()})
+		})
 	case "cache":
 		if *upstream == "" {
 			return errors.New("--upstream is required for the cache tier")
