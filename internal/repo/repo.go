@@ -29,13 +29,13 @@ type Repo struct {
 	// subtrees).
 	OnCreate func(id object.ID)
 
-	cs    *derive.Type // changeset -> root tree, history root, commit graph (one record)
+	cs *derive.Type // changeset -> root tree, history root, commit graph (one record)
 
 	unodes   *store.MemLRU // decoded directory versions
 	batches  sync.Map      // link -> map[path]storedEntry
 	nbatches atomic.Int64
-	blame *derive.Type // file version -> blame runs (lazy)
-	nodes nodeCache
+	blame    *derive.Type // file version -> blame runs (lazy)
+	nodes    nodeCache
 }
 
 var (
