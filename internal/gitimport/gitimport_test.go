@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -43,10 +44,16 @@ func buildRepo(t *testing.T) string {
 	git(t, d, "init", "-q", "-b", "main")
 	put(t, d, "a/x.txt", "1\n2\n3\n")
 	put(t, d, "a/y.txt", "y\n")
-	put(t, d, "weird name \"q\"/é.txt", "unicode\n")
+	if runtime.GOOS == "windows" {
+		put(t, d, "weird name/é.txt", "unicode\n") // quotes are not allowed in Windows names
+	} else {
+		put(t, d, "weird name \"q\"/é.txt", "unicode\n")
+	}
 	put(t, d, "run.sh", "#!/bin/sh\n")
 	os.Chmod(filepath.Join(d, "run.sh"), 0o755)
-	os.Symlink("a/x.txt", filepath.Join(d, "link"))
+	if runtime.GOOS != "windows" { // symlinks need privileges there
+		os.Symlink("a/x.txt", filepath.Join(d, "link"))
+	}
 	git(t, d, "add", "-A")
 	git(t, d, "commit", "-qm", "init")
 	git(t, d, "checkout", "-qb", "side")

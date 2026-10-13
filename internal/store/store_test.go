@@ -39,6 +39,7 @@ func TestDiskCacheReopenAndTornWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer c2.Close()
 	for id, want := range ids {
 		got, err := c2.Get(id)
 		if err != nil || !bytes.Equal(got, want) {
@@ -59,6 +60,7 @@ func TestDiskCacheBoundedWithPromotion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer c.Close()
 	hotID, hot := obj(-1, 4000)
 	c.Put(hotID, hot)
 	for i := 0; i < 20000; i++ {

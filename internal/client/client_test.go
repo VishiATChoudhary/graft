@@ -57,6 +57,7 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { dc.Close() })
 	sock := filepath.Join(t.TempDir(), "d.sock")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
@@ -108,6 +109,9 @@ func TestCloneCommitLand(t *testing.T) {
 	// Agent 1: sparse clone through the daemon.
 	root1 := filepath.Join(t.TempDir(), "wc1")
 	w1, err := client.Init(root1, client.Config{Server: e.server, Objects: e.daemon, Sparse: []string{"svc/a"}, Author: "a1"})
+	if w1 != nil {
+		t.Cleanup(func() { w1.Close() })
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +126,9 @@ func TestCloneCommitLand(t *testing.T) {
 	// Agent 2: full clone direct to server with a local cache.
 	root2 := filepath.Join(t.TempDir(), "wc2")
 	w2, err := client.Init(root2, client.Config{Server: e.server, Author: "a2"})
+	if w2 != nil {
+		t.Cleanup(func() { w2.Close() })
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,6 +219,9 @@ func TestConflictingLand(t *testing.T) {
 	}
 	root := filepath.Join(t.TempDir(), "wc")
 	w, _ := client.Init(root, client.Config{Server: e.server, Author: "a"})
+	if w != nil {
+		t.Cleanup(func() { w.Close() })
+	}
 	if _, err := w.Checkout(ctx, "main", false); err != nil {
 		t.Fatal(err)
 	}
@@ -248,6 +258,9 @@ func TestWatchedStatusMatchesFullScan(t *testing.T) {
 	}
 	root := filepath.Join(t.TempDir(), "wc")
 	w, _ := client.Init(root, client.Config{Server: e.server, Author: "a"})
+	if w != nil {
+		t.Cleanup(func() { w.Close() })
+	}
 	if _, err := w.Checkout(ctx, "main", false); err != nil {
 		t.Fatal(err)
 	}

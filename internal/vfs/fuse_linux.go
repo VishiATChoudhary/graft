@@ -77,7 +77,9 @@ func (f *fuseFS) OpenDir(name string, _ *fuse.Context) ([]fuse.DirEntry, fuse.St
 }
 
 func (f *fuseFS) Open(name string, flags uint32, _ *fuse.Context) (nodefs.File, fuse.Status) {
-	bf, err := f.fs.OpenFile(name, int(flags)&^syscall.O_EXCL, 0)
+	// The kernel computes append offsets itself, and WriteAt refuses
+	// files opened with O_APPEND.
+	bf, err := f.fs.OpenFile(name, int(flags)&^(syscall.O_EXCL|syscall.O_APPEND), 0)
 	if err != nil {
 		return nil, errno(err)
 	}
@@ -85,7 +87,7 @@ func (f *fuseFS) Open(name string, flags uint32, _ *fuse.Context) (nodefs.File, 
 }
 
 func (f *fuseFS) Create(name string, flags uint32, mode uint32, _ *fuse.Context) (nodefs.File, fuse.Status) {
-	bf, err := f.fs.OpenFile(name, int(flags)|os.O_CREATE, os.FileMode(mode))
+	bf, err := f.fs.OpenFile(name, (int(flags)|os.O_CREATE)&^syscall.O_APPEND, os.FileMode(mode))
 	if err != nil {
 		return nil, errno(err)
 	}

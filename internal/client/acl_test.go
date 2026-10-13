@@ -74,6 +74,9 @@ func TestAccessControl(t *testing.T) {
 	// Alice clones everything through the cache (warming it).
 	aroot := filepath.Join(t.TempDir(), "alice")
 	aw, _ := client.Init(aroot, client.Config{Server: srv.URL, Objects: cache.URL, Token: "alice-token", Author: "alice"})
+	if aw != nil {
+		t.Cleanup(func() { aw.Close() })
+	}
 	if _, err := aw.Checkout(ctx, "main", false); err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +87,9 @@ func TestAccessControl(t *testing.T) {
 	// Bob clones through the same cache: the secrets directory is skipped.
 	broot := filepath.Join(t.TempDir(), "bob")
 	bw, _ := client.Init(broot, client.Config{Server: srv.URL, Objects: cache.URL, Token: "bob-token", Author: "bob"})
+	if bw != nil {
+		t.Cleanup(func() { bw.Close() })
+	}
 	st, err := bw.Checkout(ctx, "main", false)
 	if err != nil {
 		t.Fatal(err)

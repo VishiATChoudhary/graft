@@ -136,6 +136,14 @@ func Open(root string) (*Worktree, error) {
 	return w, nil
 }
 
+// Close releases the local object cache.
+func (w *Worktree) Close() error {
+	if w.cache != nil {
+		return w.cache.Close()
+	}
+	return nil
+}
+
 func (w *Worktree) SaveHead() error   { return writeJSON(meta(w.Root, "HEAD.json"), w.Head) }
 func (w *Worktree) SaveConfig() error { return writeJSON(meta(w.Root, "config.json"), w.Config) }
 
