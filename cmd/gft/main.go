@@ -254,7 +254,6 @@ func cmdImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	r, err := repo.Open(db)
 	if err != nil {
 		return err
@@ -272,12 +271,15 @@ func cmdImport(args []string) error {
 		fmt.Println(db.Stats())
 	}
 	// Reopen once so pebble drops write-ahead log files left from the bulk load.
-	db.Close()
-	if db, err = store.OpenDB(*data, 64<<20); err != nil {
+	if err := db.Close(); err != nil {
+		return err
+	}
+	db2, err := store.OpenDB(*data, 64<<20)
+	if err != nil {
 		return err
 	}
 	time.Sleep(200 * time.Millisecond) // obsolete files are deleted asynchronously
-	return nil
+	return db2.Close()
 }
 
 func cmdClone(args []string) error {

@@ -117,34 +117,6 @@ func (u *Unode) find(name string) int {
 	return -1
 }
 
-func (r *Repo) computeUnode(id object.ID, parents []object.ID, vals [][]byte) ([]byte, error) {
-	cs, err := r.Changeset(id)
-	if err != nil {
-		return nil, err
-	}
-	var p1 object.ID
-	if len(vals) > 0 {
-		copy(p1[:], vals[0])
-	}
-	if len(cs.Changes) == 0 {
-		return p1[:], nil
-	}
-	seq, err := r.DB.LogSeq(id)
-	if err != nil {
-		return nil, err
-	}
-	if len(parents) > 0 {
-		if err := r.recordRenames(parents[0], p1, seq, cs.Changes); err != nil {
-			return nil, err
-		}
-	}
-	u, err := r.applyUnode("", p1, cs.Changes, seq)
-	if err != nil {
-		return nil, err
-	}
-	return u[:], nil
-}
-
 // tombstoneDir marks every live entry beneath a directory unode deleted.
 func (r *Repo) tombstoneDir(path string, id object.ID, link uint64) (object.ID, error) {
 	u, err := r.readUnode(id)
@@ -241,13 +213,11 @@ func (r *Repo) applyUnode(dir string, p1 object.ID, changes []object.Change, lin
 
 // RootUnode returns the root history unode of a changeset.
 func (r *Repo) RootUnode(id object.ID) (object.ID, error) {
-	v, err := r.eng.Get(r.unode, id)
-	if err != nil {
+	c, err := r.csInfo(id)
+	if err != nil || c.Link == 0 {
 		return object.Zero, err
 	}
-	var u object.ID
-	copy(u[:], v)
-	return u, nil
+	return versionKey("", c.Link), nil
 }
 
 // pathVersion identifies one version of a path.

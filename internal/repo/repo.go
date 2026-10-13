@@ -22,10 +22,9 @@ type Repo struct {
 	DB  store.Backend
 	eng *derive.Engine
 
-	root  *derive.Type // changeset -> root tree ID
-	graph *derive.Type // changeset -> generation, first-parent depth, parents, skip list
-	unode *derive.Type // changeset -> root history unode
-	blame *derive.Type // file unode -> blame runs (lazy)
+	cs    *derive.Type // changeset -> root tree, history root, commit graph (one record)
+	blame *derive.Type // file version -> blame runs (lazy)
+	nodes nodeCache
 
 }
 
@@ -47,9 +46,7 @@ func Open(db store.Backend) (*Repo, error) {
 		}
 		return cs.Parents, nil
 	}
-	r.graph = r.eng.Register(&derive.Type{Name: "graph", Eager: true, Parents: csParents, Compute: r.computeGraph}, 64<<20)
-	r.root = r.eng.Register(&derive.Type{Name: "root", Eager: true, Parents: csParents, Compute: r.computeRoot}, 16<<20)
-	r.unode = r.eng.Register(&derive.Type{Name: "unode", Eager: true, Parents: csParents, Compute: r.computeUnode}, 16<<20)
+	r.cs = r.eng.Register(&derive.Type{Name: "cs", Eager: true, Parents: csParents, Compute: r.computeCS}, 64<<20)
 	r.blame = r.eng.Register(&derive.Type{Name: "blame", Eager: false, Parents: r.blameParents, Compute: r.computeBlame}, 128<<20)
 	return r, nil
 }
@@ -121,45 +118,11 @@ func (r *Repo) append(cs *object.Changeset) (object.ID, error) {
 
 // RootTree returns the root tree of a changeset (Zero for an empty tree).
 func (r *Repo) RootTree(id object.ID) (object.ID, error) {
-	v, err := r.eng.Get(r.root, id)
+	c, err := r.csInfo(id)
 	if err != nil {
 		return object.Zero, err
 	}
-	var t object.ID
-	copy(t[:], v)
-	return t, nil
-}
-
-func (r *Repo) computeRoot(id object.ID, parents []object.ID, vals [][]byte) ([]byte, error) {
-	cs, err := r.Changeset(id)
-	if err != nil {
-		return nil, err
-	}
-	var base object.ID
-	if len(vals) > 0 {
-		copy(base[:], vals[0])
-	}
-	t, err := r.applyTree(base, cs.Changes)
-	if err != nil {
-		return nil, err
-	}
-	// Merges: the other parents' versions of merged paths would otherwise
-	// never get a newer version to be stored as deltas against.
-	for _, p := range parents[min(1, len(parents)):] {
-		proot, err := r.RootTree(p)
-		if err != nil {
-			return nil, err
-		}
-		for _, ch := range cs.Changes {
-			if ch.Mode != object.ModeFile && ch.Mode != object.ModeExec {
-				continue
-			}
-			if e := r.fileAt(proot, ch.Path); (e.Mode == object.ModeFile || e.Mode == object.ModeExec) && e.ID != ch.Blob {
-				r.reverseDeltify(e.ID, ch.Blob, e.Size)
-			}
-		}
-	}
-	return t[:], nil
+	return c.Root, nil
 }
 
 // Refs.

@@ -27,7 +27,7 @@ type renameCand struct {
 
 // recordRenames stores, for each path a changeset renamed, the source
 // path version (derived data keyed by the new path version).
-func (r *Repo) recordRenames(parent, _ object.ID, seq uint64, changes []object.Change) error {
+func (r *Repo) recordRenames(parent object.ID, seq uint64, changes []object.Change) error {
 	src, err := r.detectRenames(parent, changes)
 	if err != nil {
 		return err

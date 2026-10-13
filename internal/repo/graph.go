@@ -3,6 +3,7 @@ package repo
 import (
 	"container/heap"
 	"fmt"
+	"sync"
 
 	"github.com/VishiATChoudhary/graft/internal/object"
 )
@@ -23,80 +24,215 @@ type GraphNode struct {
 	Skips   []uint64
 }
 
-func encodeGraph(g *GraphNode) []byte {
+// csInfo is the single derived record kept per changeset: its root tree,
+// the link (log sequence) of its root history unode, and its commit-graph
+// entry. Parents and skips are log sequence numbers, so the record is a few
+// dozen bytes.
+type csInfo struct {
+	Root       object.ID
+	Link       uint64 // 0: empty history
+	Gen, Depth uint64
+	Parents    []uint64
+	Skips      []uint64
+}
+
+func (c *csInfo) encode() []byte {
 	var e object.Encoder
-	e.Uvarint(g.Gen)
-	e.Uvarint(g.Depth)
-	e.Uvarint(uint64(len(g.Parents)))
-	for _, p := range g.Parents {
-		e.ID(p)
+	if c.Root.IsZero() {
+		e.Byte(0)
+	} else {
+		e.Byte(1)
+		e.ID(c.Root)
 	}
-	e.Uvarint(uint64(len(g.Skips)))
-	for _, s := range g.Skips {
+	e.Uvarint(c.Link)
+	e.Uvarint(c.Gen)
+	e.Uvarint(c.Depth)
+	e.Uvarint(uint64(len(c.Parents)))
+	for _, p := range c.Parents {
+		e.Uvarint(p)
+	}
+	e.Uvarint(uint64(len(c.Skips)))
+	for _, s := range c.Skips {
 		e.Uvarint(s)
 	}
 	return e.B
 }
 
-func decodeGraph(b []byte) (*GraphNode, error) {
+func decodeCS(b []byte) (*csInfo, error) {
 	d := object.Decoder{B: b}
-	g := &GraphNode{Gen: d.Uvarint(), Depth: d.Uvarint()}
+	c := &csInfo{}
+	if d.Byte() == 1 {
+		c.Root = d.ID()
+	}
+	c.Link, c.Gen, c.Depth = d.Uvarint(), d.Uvarint(), d.Uvarint()
 	n := d.Uvarint()
+	if n > uint64(len(b)) {
+		return nil, object.ErrCorrupt
+	}
 	for i := uint64(0); i < n && d.Err == nil; i++ {
-		g.Parents = append(g.Parents, d.ID())
+		c.Parents = append(c.Parents, d.Uvarint())
 	}
 	n = d.Uvarint()
-	for i := uint64(0); i < n && d.Err == nil; i++ {
-		g.Skips = append(g.Skips, d.Uvarint())
+	if n > uint64(len(b)) {
+		return nil, object.ErrCorrupt
 	}
-	return g, d.Err
+	for i := uint64(0); i < n && d.Err == nil; i++ {
+		c.Skips = append(c.Skips, d.Uvarint())
+	}
+	return c, d.Err
 }
 
-func (r *Repo) computeGraph(id object.ID, parents []object.ID, vals [][]byte) ([]byte, error) {
-	g := &GraphNode{Gen: 1, Parents: parents}
-	for _, v := range vals {
-		pg, err := decodeGraph(v)
-		if err != nil {
+// computeCS derives a changeset's record from its parents' records.
+func (r *Repo) computeCS(id object.ID, parents []object.ID, vals [][]byte) ([]byte, error) {
+	cs, err := r.Changeset(id)
+	if err != nil {
+		return nil, err
+	}
+	seq, err := r.DB.LogSeq(id)
+	if err != nil {
+		return nil, err
+	}
+	ps := make([]*csInfo, len(vals))
+	for i, v := range vals {
+		if ps[i], err = decodeCS(v); err != nil {
 			return nil, err
-		}
-		if pg.Gen+1 > g.Gen {
-			g.Gen = pg.Gen + 1
 		}
 	}
-	if len(parents) > 0 {
-		p1, err := decodeGraph(vals[0])
+	c := &csInfo{Gen: 1}
+	for i, p := range parents {
+		s, err := r.DB.LogSeq(p)
 		if err != nil {
 			return nil, err
 		}
-		g.Depth = p1.Depth + 1
-		s0, err := r.DB.LogSeq(parents[0])
-		if err != nil {
-			return nil, err
+		c.Parents = append(c.Parents, s)
+		if ps[i].Gen+1 > c.Gen {
+			c.Gen = ps[i].Gen + 1
 		}
-		g.Skips = append(g.Skips, s0)
+	}
+	var p1 *csInfo
+	if len(ps) > 0 {
+		p1 = ps[0]
+		c.Depth = p1.Depth + 1
+		c.Skips = append(c.Skips, c.Parents[0])
 		// skip[k] = skip[k-1] of skip[k-1]. Ancestors are always derived
 		// before descendants, so these lookups never recurse deeply.
-		for k := 1; uint64(1)<<k <= g.Depth; k++ {
-			mid, err := r.graphAtSeq(g.Skips[k-1])
+		for k := 1; uint64(1)<<k <= c.Depth; k++ {
+			mid, err := r.graphAtSeq(c.Skips[k-1])
 			if err != nil {
 				return nil, err
 			}
 			if len(mid.Skips) < k {
 				break
 			}
-			g.Skips = append(g.Skips, mid.Skips[k-1])
+			c.Skips = append(c.Skips, mid.Skips[k-1])
 		}
 	}
-	return encodeGraph(g), nil
+	// Root tree.
+	var baseRoot object.ID
+	if p1 != nil {
+		baseRoot = p1.Root
+	}
+	if c.Root, err = r.applyTree(baseRoot, cs.Changes); err != nil {
+		return nil, err
+	}
+	// Merges: the other parents' versions of merged paths would otherwise
+	// never get a newer version to be stored as deltas against.
+	for _, p := range ps[min(1, len(ps)):] {
+		for _, ch := range cs.Changes {
+			if ch.Mode != object.ModeFile && ch.Mode != object.ModeExec {
+				continue
+			}
+			if e := r.fileAt(p.Root, ch.Path); (e.Mode == object.ModeFile || e.Mode == object.ModeExec) && e.ID != ch.Blob {
+				r.reverseDeltify(e.ID, ch.Blob, e.Size)
+			}
+		}
+	}
+	// History unodes.
+	var p1Unode object.ID
+	if p1 != nil {
+		c.Link = p1.Link
+		if p1.Link != 0 {
+			p1Unode = versionKey("", p1.Link)
+		}
+	}
+	if len(cs.Changes) > 0 {
+		if len(parents) > 0 {
+			if err := r.recordRenames(parents[0], seq, cs.Changes); err != nil {
+				return nil, err
+			}
+		}
+		u, err := r.applyUnode("", p1Unode, cs.Changes, seq)
+		if err != nil {
+			return nil, err
+		}
+		c.Link = 0
+		if !u.IsZero() {
+			c.Link = seq
+		}
+	}
+	return c.encode(), nil
 }
 
-// Graph returns the commit-graph node for a changeset.
-func (r *Repo) Graph(id object.ID) (*GraphNode, error) {
-	v, err := r.eng.Get(r.graph, id)
+func (r *Repo) csInfo(id object.ID) (*csInfo, error) {
+	v, err := r.eng.Get(r.cs, id)
 	if err != nil {
 		return nil, err
 	}
-	return decodeGraph(v)
+	return decodeCS(v)
+}
+
+// Graph returns the commit-graph node for a changeset, with parents as IDs.
+func (r *Repo) Graph(id object.ID) (*GraphNode, error) {
+	if g := r.nodes.get(id); g != nil {
+		return g, nil
+	}
+	c, err := r.csInfo(id)
+	if err != nil {
+		return nil, err
+	}
+	g := &GraphNode{Gen: c.Gen, Depth: c.Depth, Skips: c.Skips}
+	for _, s := range c.Parents {
+		pid, err := r.DB.LogID(s)
+		if err != nil {
+			return nil, err
+		}
+		g.Parents = append(g.Parents, pid)
+	}
+	r.nodes.put(id, g)
+	return g, nil
+}
+
+// nodeCache keeps decoded graph nodes (parents resolved to IDs) for graph
+// walks. It is bounded; eviction is arbitrary, which suits a cache of
+// immutable values.
+type nodeCache struct {
+	mu sync.Mutex
+	m  map[object.ID]*GraphNode
+}
+
+const nodeCacheMax = 1 << 20
+
+func (c *nodeCache) get(id object.ID) *GraphNode {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[id]
+}
+
+func (c *nodeCache) put(id object.ID, g *GraphNode) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[object.ID]*GraphNode{}
+	}
+	if len(c.m) >= nodeCacheMax {
+		for k := range c.m {
+			delete(c.m, k)
+			if len(c.m) < nodeCacheMax*3/4 {
+				break
+			}
+		}
+	}
+	c.m[id] = g
 }
 
 func (r *Repo) graphAtSeq(seq uint64) (*GraphNode, error) {
