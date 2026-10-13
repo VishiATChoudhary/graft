@@ -197,7 +197,7 @@ func (t *Tier) FetchFlags(ctx context.Context, ids []object.ID, fn func(object.I
 	}
 	auth := AuthFrom(ctx)
 	waits := make(map[object.ID]*call, len(misses))
-	var mine []object.ID
+	var mine, arrived []object.ID
 	t.mu.Lock()
 	for _, id := range misses {
 		if _, dup := waits[id]; dup {
@@ -206,6 +206,12 @@ func (t *Tier) FetchFlags(ctx context.Context, ids []object.ID, fn func(object.I
 		k := flightKey{id, auth}
 		c, ok := t.inflight[k]
 		if !ok {
+			// Another request may have fetched it since our local miss
+			// (fetchUpstream stores before leaving the inflight map).
+			if has, _ := t.Local.Has(id); has {
+				arrived = append(arrived, id)
+				continue
+			}
 			c = &call{done: make(chan struct{})}
 			t.inflight[k] = c
 			mine = append(mine, id)
@@ -213,6 +219,22 @@ func (t *Tier) FetchFlags(ctx context.Context, ids []object.ID, fn func(object.I
 		waits[id] = c
 	}
 	t.mu.Unlock()
+	for _, id := range arrived {
+		b, err := t.Local.Get(id)
+		if err != nil {
+			// Evicted in between: fetch it ourselves.
+			c := &call{done: make(chan struct{})}
+			t.mu.Lock()
+			t.inflight[flightKey{id, auth}] = c
+			t.mu.Unlock()
+			waits[id] = c
+			mine = append(mine, id)
+			continue
+		}
+		if err := fn(id, b, false); err != nil {
+			return err
+		}
+	}
 
 	if len(mine) > 0 {
 		t.fetchUpstream(ctx, mine, auth)
@@ -221,7 +243,7 @@ func (t *Tier) FetchFlags(ctx context.Context, ids []object.ID, fn func(object.I
 	for _, id := range misses {
 		c := waits[id]
 		if c == nil {
-			continue
+			continue // served from the local store above
 		}
 		select {
 		case <-c.done:
