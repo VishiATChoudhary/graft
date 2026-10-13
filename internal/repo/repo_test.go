@@ -56,12 +56,12 @@ func fleetURLs(t *testing.T, n int) []string {
 			t.Fatal(err)
 		}
 		dbs = append(dbs, db)
-		srv := httptest.NewServer(store.NodeHandler(db))
+		srv := httptest.NewServer(store.NodeHandler(db, nil))
 		srvs = append(srvs, srv)
 		urls = append(urls, srv.URL)
 	}
 	for i, db := range dbs {
-		db.SetPeers(store.PeerResolver(urls, i, db))
+		db.SetPeers(store.PeerResolver(store.ParseFleet(urls), i, db))
 	}
 	t.Cleanup(func() {
 		for i := range srvs {

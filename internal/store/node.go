@@ -22,7 +22,7 @@ import (
 //
 // Wire formats are compact binary: IDs are 32 raw bytes, integers are
 // big-endian, and object payloads are length-prefixed frames.
-func NodeHandler(db *DB) http.Handler {
+func NodeHandler(db *DB, meta *MetaGroup) http.Handler {
 	mux := http.NewServeMux()
 	ids := func(w http.ResponseWriter, r *http.Request) ([]object.ID, bool) {
 		b, err := io.ReadAll(io.LimitReader(r.Body, 1<<26))
@@ -37,6 +37,12 @@ func NodeHandler(db *DB) http.Handler {
 		return out, true
 	}
 	fail := func(w http.ResponseWriter, err error) {
+		var nl *NotLeaderError
+		if errors.As(err, &nl) {
+			w.Header().Set("X-Graft-Leader", nl.Leader)
+			http.Error(w, err.Error(), http.StatusMisdirectedRequest)
+			return
+		}
 		if errors.Is(err, object.ErrNotFound) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
@@ -218,7 +224,30 @@ func NodeHandler(db *DB) http.Handler {
 			}
 		}
 	})
+	// Metadata (refs, log) goes through the Raft group when replicated.
+	barrier := func() error {
+		if meta == nil {
+			return nil
+		}
+		return meta.ReadBarrier()
+	}
+	casRef := db.CASRef
+	appendLog := db.AppendLog
+	if meta != nil {
+		casRef, appendLog = meta.CASRef, meta.AppendLog
+	}
+	// Followers may lag: a log entry they lack may exist on the leader.
+	lagging := func(err error) error {
+		if meta != nil && errors.Is(err, object.ErrNotFound) && !meta.IsLeader() {
+			return meta.notLeader()
+		}
+		return err
+	}
 	mux.HandleFunc("/kv/ref", func(w http.ResponseWriter, r *http.Request) {
+		if err := barrier(); err != nil {
+			fail(w, err)
+			return
+		}
 		id, err := db.GetRef(r.URL.Query().Get("name"))
 		if err != nil {
 			fail(w, err)
@@ -235,7 +264,7 @@ func NodeHandler(db *DB) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		err := db.CASRef(req.Name, req.Old, req.New)
+		err := casRef(req.Name, req.Old, req.New)
 		var rm *RefMismatch
 		if errors.As(err, &rm) {
 			w.WriteHeader(http.StatusConflict)
@@ -247,6 +276,10 @@ func NodeHandler(db *DB) http.Handler {
 		}
 	})
 	mux.HandleFunc("/kv/refs", func(w http.ResponseWriter, r *http.Request) {
+		if err := barrier(); err != nil {
+			fail(w, err)
+			return
+		}
 		refs, err := db.ListRefs()
 		if err != nil {
 			fail(w, err)
@@ -259,7 +292,7 @@ func NodeHandler(db *DB) http.Handler {
 		if !ok || len(list) != 1 {
 			return
 		}
-		seq, err := db.AppendLog(list[0])
+		seq, err := appendLog(list[0])
 		if err != nil {
 			fail(w, err)
 			return
@@ -274,7 +307,7 @@ func NodeHandler(db *DB) http.Handler {
 		out := make([]byte, 0, 8*len(list))
 		for _, id := range list {
 			s, err := db.LogSeq(id)
-			if errors.Is(err, object.ErrNotFound) {
+			if err = lagging(err); errors.Is(err, object.ErrNotFound) {
 				s = 0
 			} else if err != nil {
 				fail(w, err)
@@ -288,16 +321,24 @@ func NodeHandler(db *DB) http.Handler {
 		seq, _ := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
 		id, err := db.LogID(seq)
 		if err != nil {
-			fail(w, err)
+			fail(w, lagging(err))
 			return
 		}
 		w.Write(id[:])
 	})
 	mux.HandleFunc("/kv/log/last", func(w http.ResponseWriter, r *http.Request) {
+		if err := barrier(); err != nil {
+			fail(w, err)
+			return
+		}
 		s, _ := db.LastLogSeq()
 		w.Write(be64(s))
 	})
 	mux.HandleFunc("/kv/log/prefix", func(w http.ResponseWriter, r *http.Request) {
+		if err := barrier(); err != nil {
+			fail(w, err)
+			return
+		}
 		p, err := hex.DecodeString(r.URL.Query().Get("p"))
 		if err != nil {
 			http.Error(w, "bad prefix", http.StatusBadRequest)

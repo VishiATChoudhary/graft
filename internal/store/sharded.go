@@ -15,21 +15,30 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/VishiATChoudhary/graft/internal/object"
 )
 
-// Sharded is a Backend over a fleet of storage nodes (NodeHandler). Objects
-// and derived data are placed by ID prefix; refs and the changeset log live
-// on shard 0. Everything immutable is cached in memory, so API servers using
-// Sharded are, as in Scion, essentially large caches that also compute
-// derived data and write it back. Any number of API servers can share one
-// fleet: the only mutable state (refs, log sequence) is updated atomically
-// on its node.
+// Sharded is a Backend over a fleet of storage nodes (NodeHandler).
+//
+// Objects and derived data are placed by ID prefix on shards. Each shard is
+// a replica set ("u1|u2|u3"): immutable writes go to every replica and
+// succeed once a majority acknowledges; reads go to one replica and fail
+// over to the others (repairing a replica that missed a write). The only
+// mutable state, refs and the changeset log, lives on shard 0, whose
+// replicas run Raft: metadata calls follow the leader, and survive a leader
+// failure once a new one is elected.
+//
+// Everything immutable is cached in memory, so API servers using Sharded
+// are, as in Scion, essentially large caches that also compute derived data
+// and write it back. Any number of API servers can share one fleet.
 type Sharded struct {
-	nodes  []string
+	shards [][]string
 	client *http.Client
+	rr     atomic.Uint32
+	leader atomic.Value // string: last known metadata leader
 
 	hot      *MemLRU // stored objects
 	payloads *MemLRU // [kind]+payload
@@ -45,27 +54,44 @@ func ShardOf(id object.ID, n int) int {
 	return int(binary.BigEndian.Uint16(id[:2])) % n
 }
 
-// NewSharded connects to storage nodes, in shard order.
+// ParseFleet parses "a|b|c,d|e|f" (already split on commas) into shards of
+// replica URLs.
+func ParseFleet(spec []string) [][]string {
+	var out [][]string
+	for _, s := range spec {
+		var reps []string
+		for _, u := range strings.Split(s, "|") {
+			if u = strings.TrimRight(strings.TrimSpace(u), "/"); u != "" {
+				reps = append(reps, u)
+			}
+		}
+		if len(reps) > 0 {
+			out = append(out, reps)
+		}
+	}
+	return out
+}
+
+// NewSharded connects to storage nodes, in shard order. Each entry may list
+// replicas separated by "|".
 func NewSharded(nodes []string, cacheBytes int64) *Sharded {
 	tr := &http.Transport{
 		MaxIdleConns:        1024,
 		MaxIdleConnsPerHost: 256,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  true,
-		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-	}
-	for i := range nodes {
-		nodes[i] = strings.TrimRight(nodes[i], "/")
+		DialContext:         (&net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 	}
 	if cacheBytes <= 0 {
 		cacheBytes = 1 << 30
 	}
-	return &Sharded{nodes: nodes, client: &http.Client{Transport: tr, Timeout: 5 * time.Minute},
+	s := &Sharded{shards: ParseFleet(nodes), client: &http.Client{Transport: tr, Timeout: 5 * time.Minute},
 		hot: NewMemLRU(cacheBytes / 2), payloads: NewMemLRU(cacheBytes / 2)}
+	s.leader.Store("")
+	return s
 }
 
-func (s *Sharded) node(id object.ID) string { return s.nodes[ShardOf(id, len(s.nodes))] }
-func (s *Sharded) meta() string             { return s.nodes[0] }
+func (s *Sharded) replicas(id object.ID) []string { return s.shards[ShardOf(id, len(s.shards))] }
 
 type httpStatusError struct {
 	code int
@@ -74,6 +100,7 @@ type httpStatusError struct {
 
 func (e *httpStatusError) Error() string { return fmt.Sprintf("storage node: %d %s", e.code, e.msg) }
 
+// call performs one request. 404 maps to ErrNotFound; 421 to NotLeaderError.
 func (s *Sharded) call(method, url string, body []byte) ([]byte, int, error) {
 	var rd io.Reader
 	if body != nil {
@@ -97,8 +124,106 @@ func (s *Sharded) call(method, url string, body []byte) ([]byte, int, error) {
 		return b, resp.StatusCode, nil
 	case http.StatusNotFound:
 		return nil, resp.StatusCode, object.ErrNotFound
+	case http.StatusMisdirectedRequest:
+		return nil, resp.StatusCode, &NotLeaderError{Leader: resp.Header.Get("X-Graft-Leader")}
 	}
 	return nil, resp.StatusCode, &httpStatusError{resp.StatusCode, strings.TrimSpace(string(b))}
+}
+
+// readAny asks replicas in turn (starting at a rotating one) until one
+// returns an answer; found reports whether the body holds the data (as
+// opposed to "this replica lacks it"). Replicas that lacked found data are
+// passed to repair.
+func (s *Sharded) readAny(reps []string, path string, body []byte, found func([]byte) bool, repair func(missed []string, b []byte)) ([]byte, error) {
+	start := int(s.rr.Add(1)) % len(reps)
+	var missed []string
+	var lastErr error
+	for i := range reps {
+		u := reps[(start+i)%len(reps)]
+		b, _, err := s.call("POST", u+path, body)
+		if err != nil {
+			if errors.Is(err, object.ErrNotFound) {
+				missed = append(missed, u)
+			} else {
+				lastErr = err
+			}
+			continue
+		}
+		if found(b) {
+			if len(missed) > 0 && repair != nil {
+				go repair(missed, b)
+			}
+			return b, nil
+		}
+		missed = append(missed, u)
+	}
+	// Absent only if a majority of replicas answered that it is absent
+	// (writes reach a majority, so any majority intersects them).
+	if len(missed) >= len(reps)/2+1 {
+		return nil, object.ErrNotFound
+	}
+	if lastErr == nil {
+		lastErr = object.ErrNotFound
+	}
+	return nil, lastErr
+}
+
+// writeAll sends an idempotent write to every replica and succeeds once a
+// majority acknowledges it.
+func (s *Sharded) writeAll(reps []string, path string, body []byte) error {
+	ch := make(chan error, len(reps))
+	for _, u := range reps {
+		go func(u string) {
+			_, _, err := s.call("POST", u+path, body)
+			ch <- err
+		}(u)
+	}
+	ok, need := 0, len(reps)/2+1
+	var firstErr error
+	for range reps {
+		if err := <-ch; err == nil {
+			ok++
+			if ok >= need {
+				return nil // stragglers finish in the background
+			}
+		} else if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return fmt.Errorf("write reached %d of %d replicas (need %d): %w", ok, len(reps), need, firstErr)
+}
+
+// meta performs a metadata call against shard 0's leader, following
+// redirects and retrying through elections.
+func (s *Sharded) meta(method, path string, body []byte) ([]byte, int, error) {
+	reps := s.shards[0]
+	deadline := time.Now().Add(30 * time.Second)
+	next := 0
+	for attempt := 0; ; attempt++ {
+		target := s.leader.Load().(string)
+		if target == "" {
+			target = reps[next%len(reps)]
+			next++
+		}
+		b, code, err := s.call(method, target+path, body)
+		var nl *NotLeaderError
+		switch {
+		case err == nil, errors.Is(err, object.ErrNotFound):
+			if target != s.leader.Load().(string) {
+				s.leader.Store(target)
+			}
+			return b, code, err
+		case errors.As(err, &nl) && nl.Leader != "" && nl.Leader != target:
+			s.leader.Store(nl.Leader)
+			continue
+		default:
+			s.leader.Store("") // try the next replica
+		}
+		if time.Now().After(deadline) {
+			return nil, code, err
+		}
+		time.Sleep(time.Duration(min(50*(attempt+1), 500)) * time.Millisecond)
+	}
 }
 
 // frames parses [id][u32 len][data] frames; a nil slice marks missing.
@@ -124,21 +249,46 @@ func frames(b []byte, fn func(id object.ID, data []byte)) error {
 	return nil
 }
 
+func oneFrame(b []byte) []byte {
+	var out []byte
+	frames(b, func(_ object.ID, d []byte) { out = d })
+	return out
+}
+
+func putFrame(id, base object.ID, stored []byte) []byte {
+	buf := make([]byte, 68, 68+len(stored))
+	copy(buf, id[:])
+	copy(buf[32:], base[:])
+	binary.BigEndian.PutUint32(buf[64:], uint32(len(stored)))
+	return append(buf, stored...)
+}
+
+func derivedFrame(id object.ID, v []byte) []byte {
+	buf := make([]byte, 36, 36+len(v))
+	copy(buf, id[:])
+	binary.BigEndian.PutUint32(buf[32:], uint32(len(v)))
+	return append(buf, v...)
+}
+
+func (s *Sharded) repairObject(id object.ID) func([]string, []byte) {
+	return func(missed []string, b []byte) {
+		if stored := oneFrame(b); stored != nil {
+			for _, u := range missed {
+				s.call("POST", u+"/kv/put", putFrame(id, object.Zero, stored))
+			}
+		}
+	}
+}
+
 func (s *Sharded) Get(id object.ID) ([]byte, error) {
 	if b, err := s.hot.Get(id); err == nil {
 		return b, nil
 	}
-	body, _, err := s.call("POST", s.node(id)+"/kv/get", id[:])
+	body, err := s.readAny(s.replicas(id), "/kv/get", id[:], func(b []byte) bool { return oneFrame(b) != nil }, s.repairObject(id))
 	if err != nil {
 		return nil, err
 	}
-	var out []byte
-	if err := frames(body, func(_ object.ID, d []byte) { out = d }); err != nil {
-		return nil, err
-	}
-	if out == nil {
-		return nil, object.ErrNotFound
-	}
+	out := oneFrame(body)
 	s.hot.Put(id, out)
 	return out, nil
 }
@@ -147,17 +297,11 @@ func (s *Sharded) Payload(id object.ID) (object.Kind, []byte, error) {
 	if v, err := s.payloads.Get(id); err == nil {
 		return object.Kind(v[0]), v[1:], nil
 	}
-	body, _, err := s.call("POST", s.node(id)+"/kv/payload", id[:])
+	body, err := s.readAny(s.replicas(id), "/kv/payload", id[:], func(b []byte) bool { return len(oneFrame(b)) > 0 }, nil)
 	if err != nil {
 		return 0, nil, err
 	}
-	var out []byte
-	if err := frames(body, func(_ object.ID, d []byte) { out = d }); err != nil {
-		return 0, nil, err
-	}
-	if len(out) == 0 {
-		return 0, nil, object.ErrNotFound
-	}
+	out := oneFrame(body)
 	s.payloads.Put(id, out)
 	return object.Kind(out[0]), out[1:], nil
 }
@@ -169,23 +313,20 @@ func (s *Sharded) Has(id object.ID) (bool, error) {
 	if ok, _ := s.payloads.Has(id); ok {
 		return true, nil
 	}
-	body, _, err := s.call("POST", s.node(id)+"/kv/has", id[:])
-	if err != nil {
-		return false, err
+	_, err := s.readAny(s.replicas(id), "/kv/has", id[:], func(b []byte) bool { return len(b) == 1 && b[0] == 1 }, nil)
+	if errors.Is(err, object.ErrNotFound) {
+		return false, nil
 	}
-	return len(body) == 1 && body[0] == 1, nil
+	return err == nil, err
 }
 
 func (s *Sharded) PayloadSize(id object.ID) (uint64, error) {
 	if b, err := s.hot.Get(id); err == nil {
 		return object.PayloadSize(b)
 	}
-	body, _, err := s.call("POST", s.node(id)+"/kv/size", id[:])
+	body, err := s.readAny(s.replicas(id), "/kv/size", id[:], func(b []byte) bool { return len(b) == 8 }, nil)
 	if err != nil {
 		return 0, err
-	}
-	if len(body) != 8 {
-		return 0, object.ErrCorrupt
 	}
 	return binary.BigEndian.Uint64(body), nil
 }
@@ -193,24 +334,19 @@ func (s *Sharded) PayloadSize(id object.ID) (uint64, error) {
 func (s *Sharded) Put(id object.ID, stored []byte) error { return s.PutBase(id, stored, object.Zero) }
 
 func (s *Sharded) PutBase(id object.ID, stored []byte, base object.ID) error {
-	buf := make([]byte, 68, 68+len(stored))
-	copy(buf, id[:])
-	copy(buf[32:], base[:])
-	binary.BigEndian.PutUint32(buf[64:], uint32(len(stored)))
-	buf = append(buf, stored...)
-	if _, _, err := s.call("POST", s.node(id)+"/kv/put", buf); err != nil {
+	if err := s.writeAll(s.replicas(id), "/kv/put", putFrame(id, base, stored)); err != nil {
 		return err
 	}
 	s.hot.Put(id, stored)
 	return nil
 }
 
+// Deltify is a storage hint: best effort on every replica.
 func (s *Sharded) Deltify(id, base object.ID) error {
-	_, _, err := s.call("POST", s.node(id)+"/kv/deltify", append(id[:len(id):len(id)], base[:]...))
-	if errors.Is(err, object.ErrNotFound) {
-		return nil
+	for _, u := range s.replicas(id) {
+		s.call("POST", u+"/kv/deltify", append(id[:len(id):len(id)], base[:]...))
 	}
-	return err
+	return nil
 }
 
 type derivedKey struct {
@@ -222,17 +358,18 @@ func (s *Sharded) GetDerived(kind string, id object.ID) ([]byte, error) {
 	if v, ok := s.derived.Load(derivedKey{kind, id}); ok {
 		return v.([]byte), nil
 	}
-	body, _, err := s.call("POST", s.node(id)+"/kv/derived/get?kind="+kind, id[:])
+	body, err := s.readAny(s.replicas(id), "/kv/derived/get?kind="+kind, id[:], func(b []byte) bool { return oneFrame(b) != nil },
+		func(missed []string, b []byte) {
+			if v := oneFrame(b); v != nil {
+				for _, u := range missed {
+					s.call("POST", u+"/kv/derived/put?kind="+kind, derivedFrame(id, v))
+				}
+			}
+		})
 	if err != nil {
 		return nil, err
 	}
-	var out []byte
-	if err := frames(body, func(_ object.ID, d []byte) { out = d }); err != nil {
-		return nil, err
-	}
-	if out == nil {
-		return nil, object.ErrNotFound
-	}
+	out := oneFrame(body)
 	s.cacheDerived(kind, id, out)
 	return out, nil
 }
@@ -249,11 +386,7 @@ func (s *Sharded) cacheDerived(kind string, id object.ID, v []byte) {
 }
 
 func (s *Sharded) PutDerived(kind string, id object.ID, v []byte) error {
-	buf := make([]byte, 36, 36+len(v))
-	copy(buf, id[:])
-	binary.BigEndian.PutUint32(buf[32:], uint32(len(v)))
-	buf = append(buf, v...)
-	if _, _, err := s.call("POST", s.node(id)+"/kv/derived/put?kind="+kind, buf); err != nil {
+	if err := s.writeAll(s.replicas(id), "/kv/derived/put?kind="+kind, derivedFrame(id, v)); err != nil {
 		return err
 	}
 	s.cacheDerived(kind, id, v)
@@ -261,7 +394,7 @@ func (s *Sharded) PutDerived(kind string, id object.ID, v []byte) error {
 }
 
 func (s *Sharded) GetRef(name string) (object.ID, error) {
-	body, _, err := s.call("GET", s.meta()+"/kv/ref?name="+urlEscape(name), nil)
+	body, _, err := s.meta("GET", "/kv/ref?name="+urlEscape(name), nil)
 	if err != nil {
 		return object.Zero, err
 	}
@@ -275,7 +408,7 @@ func (s *Sharded) CASRef(name string, old, new object.ID) error {
 		Name     string
 		Old, New object.ID
 	}{name, old, new})
-	body, code, err := s.call("POST", s.meta()+"/kv/ref/cas", b)
+	body, code, err := s.meta("POST", "/kv/ref/cas", b)
 	if err != nil {
 		return err
 	}
@@ -288,7 +421,7 @@ func (s *Sharded) CASRef(name string, old, new object.ID) error {
 }
 
 func (s *Sharded) ListRefs() (map[string]object.ID, error) {
-	body, _, err := s.call("GET", s.meta()+"/kv/refs", nil)
+	body, _, err := s.meta("GET", "/kv/refs", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +430,7 @@ func (s *Sharded) ListRefs() (map[string]object.ID, error) {
 }
 
 func (s *Sharded) AppendLog(id object.ID) (uint64, error) {
-	body, _, err := s.call("POST", s.meta()+"/kv/log/append", id[:])
+	body, _, err := s.meta("POST", "/kv/log/append", id[:])
 	if err != nil {
 		return 0, err
 	}
@@ -314,7 +447,7 @@ func (s *Sharded) LogSeq(id object.ID) (uint64, error) {
 	if v, ok := s.seqs.Load(id); ok {
 		return v.(uint64), nil
 	}
-	body, _, err := s.call("POST", s.meta()+"/kv/log/seq", id[:])
+	body, _, err := s.meta("POST", "/kv/log/seq", id[:])
 	if err != nil {
 		return 0, err
 	}
@@ -333,7 +466,7 @@ func (s *Sharded) LogID(seq uint64) (object.ID, error) {
 	if v, ok := s.ids.Load(seq); ok {
 		return v.(object.ID), nil
 	}
-	body, _, err := s.call("GET", s.meta()+"/kv/log/id?seq="+strconv.FormatUint(seq, 10), nil)
+	body, _, err := s.meta("GET", "/kv/log/id?seq="+strconv.FormatUint(seq, 10), nil)
 	if err != nil {
 		return object.Zero, err
 	}
@@ -344,7 +477,7 @@ func (s *Sharded) LogID(seq uint64) (object.ID, error) {
 }
 
 func (s *Sharded) LastLogSeq() (uint64, error) {
-	body, _, err := s.call("GET", s.meta()+"/kv/log/last", nil)
+	body, _, err := s.meta("GET", "/kv/log/last", nil)
 	if err != nil {
 		return 0, err
 	}
@@ -355,7 +488,7 @@ func (s *Sharded) LastLogSeq() (uint64, error) {
 }
 
 func (s *Sharded) ScanLogIdxPrefix(prefix []byte, fn func(object.ID) bool) error {
-	body, _, err := s.call("GET", s.meta()+"/kv/log/prefix?p="+hex.EncodeToString(prefix), nil)
+	body, _, err := s.meta("GET", "/kv/log/prefix?p="+hex.EncodeToString(prefix), nil)
 	if err != nil {
 		return err
 	}
@@ -370,24 +503,35 @@ func (s *Sharded) ScanLogIdxPrefix(prefix []byte, fn func(object.ID) bool) error
 }
 
 func (s *Sharded) Stats() map[string]any {
-	out := map[string]any{"shards": len(s.nodes)}
-	for i, n := range s.nodes {
-		body, _, err := s.call("GET", n+"/kv/stats", nil)
-		if err == nil {
+	out := map[string]any{"shards": len(s.shards)}
+	for i, reps := range s.shards {
+		var rs []any
+		for _, u := range reps {
+			body, _, err := s.call("GET", u+"/kv/stats", nil)
+			if err != nil {
+				rs = append(rs, map[string]any{"url": u, "error": err.Error()})
+				continue
+			}
 			var m map[string]any
 			json.Unmarshal(body, &m)
-			out["shard"+strconv.Itoa(i)] = m
+			if m == nil {
+				m = map[string]any{}
+			}
+			m["url"] = u
+			rs = append(rs, m)
 		}
+		out["shard"+strconv.Itoa(i)] = rs
 	}
 	h, m, b := s.hot.Stats()
 	out["api_cache"] = map[string]any{"hits": h, "misses": m, "bytes": b}
+	out["metadata_leader"] = s.leader.Load()
 	return out
 }
 
 func (s *Sharded) Flush() error {
-	for _, n := range s.nodes {
-		if _, _, err := s.call("POST", n+"/kv/flush", nil); err != nil {
-			return err
+	for _, reps := range s.shards {
+		for _, u := range reps {
+			s.call("POST", u+"/kv/flush", nil)
 		}
 	}
 	return nil
@@ -407,13 +551,13 @@ func urlEscape(s string) string {
 	return b.String()
 }
 
-// PeerResolver returns a BaseResolver for shard self of a fleet, fetching
-// delta bases held by other shards.
-func PeerResolver(nodes []string, self int, db *DB) BaseResolver {
+// PeerResolver returns a BaseResolver for a node of shard self, fetching
+// delta bases held by other shards (from any of their replicas).
+func PeerResolver(fleet [][]string, self int, db *DB) BaseResolver {
 	client := &http.Client{Timeout: time.Minute, Transport: &http.Transport{
 		MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, DisableCompression: true}}
 	return func(prefix object.ID, withChain bool) (*BaseInfo, error) {
-		i := ShardOf(prefix, len(nodes))
+		i := ShardOf(prefix, len(fleet))
 		if i == self {
 			return db.localBase(prefix, withChain)
 		}
@@ -421,23 +565,28 @@ func PeerResolver(nodes []string, self int, db *DB) BaseResolver {
 		if withChain {
 			chain = "1"
 		}
-		resp, err := client.Get(strings.TrimRight(nodes[i], "/") + "/kv/base?chain=" + chain + "&p=" + hex.EncodeToString(prefix[:keyIDLen]))
-		if err != nil {
-			return nil, err
+		var lastErr error = object.ErrNotFound
+		for _, u := range fleet[i] {
+			resp, err := client.Get(u + "/kv/base?chain=" + chain + "&p=" + hex.EncodeToString(prefix[:keyIDLen]))
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			// Always read to EOF so the connection is reused.
+			b, err := io.ReadAll(bufio.NewReader(resp.Body))
+			resp.Body.Close()
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if resp.StatusCode == http.StatusOK {
+				return decodeBaseInfo(b)
+			}
+			if resp.StatusCode != http.StatusNotFound {
+				lastErr = fmt.Errorf("peer %s: %s", u, resp.Status)
+			}
 		}
-		defer resp.Body.Close()
-		// Always read to EOF so the connection is reused.
-		b, err := io.ReadAll(bufio.NewReader(resp.Body))
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, object.ErrNotFound
-		}
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("peer %d: %s", i, resp.Status)
-		}
-		return decodeBaseInfo(b)
+		return nil, lastErr
 	}
 }
 

@@ -109,7 +109,10 @@ func OpenDB(dir string, cacheBytes int64) (*DB, error) {
 	for i := range opts.Levels {
 		opts.Levels[i].BlockSize = 32 << 10
 		opts.Levels[i].TargetFileSize = 64 << 20
-		opts.Levels[i].Compression = pebble.ZstdCompression
+		// Values are already compressed (zstd, dictionaries, deltas); Snappy
+		// blocks cover keys and small records. (Pebble's cgo zstd block path
+		// rejected some of our blocks: "decompressed into unexpected buffer".)
+		opts.Levels[i].Compression = pebble.SnappyCompression
 	}
 	pdb, err := pebble.Open(dir, opts)
 	if err != nil {
@@ -629,7 +632,7 @@ func (d *DB) train(ds *dictState, sample [][]byte, ids []object.ID) {
 	// Re-encode the sampled objects still stored as plain zstd.
 	for i, id := range ids {
 		b, err := d.raw(id)
-		if err != nil || len(b) < 2 || b[1] != 1 {
+		if err != nil || len(b) < 2 || b[1] > 1 { // plain (raw or zstd) records only
 			continue
 		}
 		if r := d.denseFull(id, object.Pack(ds.kind, sample[i])); len(r) > 1 && r[1] == codecDict {

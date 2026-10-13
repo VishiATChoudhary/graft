@@ -31,8 +31,12 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	tier := fs.String("tier", "server", "server | cache | daemon | store")
 	storeNodes := fs.String("store", "", "server: comma-separated storage nodes (stateless API server); omit to use --data")
-	shard := fs.Int("shard", 0, "store: this node's index in --nodes")
-	nodes := fs.String("nodes", "", "store: comma-separated URLs of every storage node, in shard order")
+	shard := fs.Int("shard", 0, "store: this node's shard index in --nodes")
+	replica := fs.Int("replica", 0, "store: this node's replica index within its shard")
+	nodes := fs.String("nodes", "", "store: every storage node: shards separated by ',', replicas by '|' (e.g. a|b|c,d|e|f)")
+	raftAddr := fs.String("raft-addr", "", "store, replicated shard 0: this replica's Raft address (host:port)")
+	raftPeers := fs.String("raft-peers", "", "store, replicated shard 0: Raft addresses of all shard-0 replicas, in replica order")
+	fastRaft := fs.Bool("fast-raft", false, "store: short Raft timeouts (single machine / tests)")
 	aclFile := fs.String("acl", "", "server: access control policy (JSON); see docs/ACL.md")
 	listen := fs.String("listen", "127.0.0.1:7070", "listen address (host:port, or unix:///path.sock)")
 	data := fs.String("data", "", "server: data directory")
@@ -82,20 +86,41 @@ func cmdServe(args []string) error {
 		if *data == "" || *nodes == "" {
 			return errors.New("the store tier needs --data and --nodes (and --shard)")
 		}
-		urls := strings.Split(*nodes, ",")
-		if *shard < 0 || *shard >= len(urls) {
-			return fmt.Errorf("--shard %d out of range for %d nodes", *shard, len(urls))
+		fleet := store.ParseFleet(strings.Split(*nodes, ","))
+		if *shard < 0 || *shard >= len(fleet) || *replica < 0 || *replica >= len(fleet[*shard]) {
+			return fmt.Errorf("--shard %d / --replica %d out of range for %s", *shard, *replica, *nodes)
 		}
 		db, err := store.OpenDB(*data, mustSize(*mem))
 		if err != nil {
 			return err
 		}
-		closeFn = func() { db.Close() }
-		db.SetPeers(store.PeerResolver(urls, *shard, db))
-		mux.Handle("/kv/", store.NodeHandler(db))
+		var meta *store.MetaGroup
+		if *shard == 0 && len(fleet[0]) > 1 {
+			peers := strings.Split(*raftPeers, ",")
+			if *raftAddr == "" || len(peers) != len(fleet[0]) {
+				return errors.New("replicated shard 0 needs --raft-addr and --raft-peers (one per replica, in order)")
+			}
+			meta, err = store.OpenMetaGroup(db, store.MetaConfig{Dir: filepath.Join(*data, "raft"), Self: *replica,
+				RaftAddr: peers, HTTP: fleet[0], Fast: *fastRaft})
+			if err != nil {
+				return err
+			}
+		}
+		closeFn = func() {
+			if meta != nil {
+				meta.Close()
+			}
+			db.Close()
+		}
+		db.SetPeers(store.PeerResolver(fleet, *shard, db))
+		mux.Handle("/kv/", store.NodeHandler(db, meta))
 		mux.HandleFunc("/v1/info", func(w http.ResponseWriter, _ *http.Request) {
-			json.NewEncoder(w).Encode(map[string]any{"tier": "store", "shard": *shard, "shards": len(urls),
-				"cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS(), "store": db.Stats()})
+			info := map[string]any{"tier": "store", "shard": *shard, "replica": *replica, "shards": len(fleet),
+				"cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS(), "store": db.Stats()}
+			if meta != nil {
+				info["metadata_leader"] = meta.IsLeader()
+			}
+			json.NewEncoder(w).Encode(info)
 		})
 	case "cache":
 		if *upstream == "" {

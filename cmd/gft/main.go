@@ -59,7 +59,8 @@ Repository queries (served by the server; no local history needed):
 
 Infrastructure:
   gft serve --tier server --data <dir> [--listen addr]                      single node
-  gft serve --tier store  --data <dir> --nodes <u0,u1,..> --shard <i>        storage shard
+  gft serve --tier store  --data <dir> --nodes <a|b|c,d|e|f> --shard <i> --replica <j>
+            [--raft-addr host:port --raft-peers r0,r1,r2]                    storage shard replica
   gft serve --tier server --store <u0,u1,..> [--listen addr]                stateless API server
   gft serve --tier cache  --upstream <server> [--mem 8G] [--listen addr]
   gft serve --tier daemon --upstream <cache> [--listen unix:///run/gft.sock] [--disk 20G] [--seed file]
