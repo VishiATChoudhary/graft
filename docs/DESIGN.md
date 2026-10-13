@@ -54,11 +54,11 @@ recurse; concurrent requests for the same value are coalesced.
 
 | Type | Keyed by | Eager | Purpose |
 |---|---|---|---|
-| `root` | changeset | yes | Root tree: parent's root plus this changeset's changes. Needed for checkout and diff. |
-| `graph` | changeset | yes | Generation number, first-parent depth, parents, and a **skip list** (`skips[k]` = first-parent ancestor 2^k back). Gives O(log n) `rev~N`, trunk ancestry checks, and stack detection for landing. |
-| `unode` | changeset | yes | Path-history manifest (after Mononoke's unodes): each file/dir node records the changeset that last modified it and its previous versions. `log <path>` walks only the commits that touched the path. Deletions leave tombstones so history survives delete/re-add. |
-| rename index | (inside `unode`) | yes | Rename detection like git's `-M50%` (exact match, then line-similarity), recorded once as `CopyFrom`. Blame follows it; `log --follow` follows it. |
-| `blame` | file unode | no | Per-file-version blame runs, computed from the previous version's blame plus a line diff. |
+| `cs` | changeset | yes | One compact record per changeset: root tree, the link of its root history version, generation number, first-parent depth, parents (as log sequence numbers) and a deterministic **skip list** (a changeset at depth d keeps pointers 2^k back for each 2^k dividing d: about two per changeset, O(log n) jumps). Gives `rev~N`, trunk ancestry checks and land-stack detection in O(log n). |
+| history (`ub`) | changeset | yes | Path-history manifest (after Mononoke's unodes): one version per changed directory, whose entries record the log sequence of the changeset that last modified each file or subdirectory. All directory versions written by a changeset are one record; each is whole or a delta against the previous version of the same directory. `log <path>` walks only commits that touched the path; previous versions are found by looking the path up at the link changeset's parents, which reproduces git's path-limited history including TREESAME merge simplification. Deletions leave tombstones so history survives delete/re-add. |
+| rename index (`copy`) | path version | yes | Rename detection like git's `-M50%` (exact, then line similarity), recorded once. Blame follows it; `log --follow` follows it. |
+| `blame` | path version | no | Blame runs per file version, computed from the previous version's blame plus a line diff (git's algorithm, see below). |
+| `acl` | tree | yes (with a policy) | Trees of access-controlled directories, for checking object fetches. |
 
 Because clients never see these structures, they can change without changing
 the client. Adding a new index is a new `derive.Type`.
@@ -121,32 +121,94 @@ testing.
 
 ## Storage (`internal/store`)
 
-* **Server**: pebble (an LSM key-value store) holds objects, derived data, the
-  changeset log, and refs under disjoint key prefixes. It stands in for Spanner
-  plus blob storage. Refs are written with sync; everything else is written
-  without fsync and becomes durable with the next synced write.
+* **Server**: pebble (an LSM key-value store) holds objects, derived data,
+  the changeset log and refs under disjoint key prefixes, standing in for
+  Spanner plus blob storage. Refs are written with sync; everything else
+  becomes durable with the next synced write.
+* **Storage codecs** (server-internal; clients always receive the standard
+  stored form, so caches and the wire are unaffected). Each is decided once,
+  at write time; nothing is ever repacked:
+  * *reverse blob deltas*: when a file changes, the new version stays whole
+    and the previous one is re-encoded as a delta against it (as in git, the
+    newest content is cheapest to read; code mostly grows, so these deltas
+    are small). Keyframes are kept pseudo-randomly with probability
+    size/64 MB, bounding the bytes rebuilt to read any version;
+  * forward deltas for trees (chains capped at 255);
+  * a zstd **dictionary** trained on the repository's own blobs for full
+    versions, and stronger zstd for blobs too large for it;
+  * delta bases also come from renames, merges' other parents, deleted
+    files' surviving siblings, and similar new siblings (same extension,
+    closest size);
+  * 16-byte storage keys and base references (2^64 objects to a likely
+    collision).
 * **Regional cache**: sharded in-memory LRU, byte-bounded.
 * **Node daemon and client**: bounded on-disk cache of append-only segment
-  files with an in-memory index. Eviction drops the oldest segment; objects
-  read from old segments are re-appended (promotion), approximating LRU. No
-  file-per-object, so caching 100k objects is 100k appends.
+  files with an in-memory index; eviction drops the oldest segment, and
+  objects read from old segments are re-appended (promotion). No
+  file-per-object. A client without a daemon caches trees only, since blobs
+  are already in its working copy.
+
+## Horizontal scaling (`store.Sharded`, `store.NodeHandler`)
+
+`gft serve --tier store` runs one storage shard. Objects and derived data are
+placed by ID prefix; refs and the changeset log live on shard 0, which
+performs ref compare-and-swap and assigns log sequence numbers atomically.
+`gft serve --tier server --store ...` runs a stateless API server over the
+fleet. It caches everything immutable and computes derived data, writing the
+results back, so any number can run. When a delta base lives on another
+shard, the storing shard fetches it from its peer, so storage stays dense
+across shards. The repository test suite runs against a 3-shard fleet in CI,
+and a test lands concurrently through three API servers and checks nothing
+is lost.
+
+## Diff, merge and blame (`internal/diff`)
+
+graft's line diff ports git's xdiff: end trimming, discarding of lines that
+cannot match or match too often, git's divide-and-conquer Myers with its
+heuristics and tie-breaking, and change compaction with the indent
+heuristic. Unified diffs, including hunk headers with function context, are
+byte-identical to `git diff` on 3000 random code-shaped inputs (tested
+against git). Blame follows git's rules: a parent with identical content
+takes the whole blame, otherwise lines pass to parents through the diff, and
+renames are followed. Server-side merges use diff3.
+
+## Working copies (`internal/client`, `internal/watch`, `internal/vfs`)
+
+* **Sparse checkouts** materialize only the requested directories; updates
+  move only changed files (from a server-computed diff) and check only the
+  paths they touch for local edits.
+* **Watcher**: `gft watch` keeps a journal of changed paths using FSEvents
+  on macOS and inotify on Linux, synchronized with cookie files like git's
+  fsmonitor. Status then examines only what changed. The index token only
+  advances when the index provably reflects every earlier change.
+* **Virtual checkout**: `gft mount` serves a revision over loopback NFSv3.
+  Unmodified files are fetched on first read; writes go to a copy-on-write
+  overlay with whiteouts for deletions. Inside the mount, `gft status`,
+  `commit`, `land` and `checkout` talk to the mount's control socket: commit
+  uploads only the overlay, and checkout and land swap the base revision in
+  place without writing files.
+
+## Search, access control, review
+
+* `gft grep` / `/v1/grep` searches a revision's contents server-side,
+  scanning blobs in parallel from the server's caches (no index to store).
+* Access control and review gates are described in
+  [ACCESS.md](ACCESS.md).
 
 ## Where graft differs from the post
 
-* **Single-node server.** The server tier is one process over a local pebble
-  store. Reads scale out through cache tiers (and any number of server
-  processes could share a distributed KV store behind the same `store`
-  interface), but graft does not ship a distributed backend.
-* **No code review, code search, or IAM.** The post's Antique code-review tool,
-  code search and directory-level IAM are out of scope.
-* **Virtual checkout is read-only** and exported over loopback NFSv3 (the same
-  approach EdenFS uses on macOS), so it needs no kernel extension. Writable
-  working copies use sparse materialization.
-* **File watching.** Status uses parallel stat with an index (size, mtime), not
-  an OS file watcher.
-* **Storage efficiency.** Objects are compressed individually rather than
-  delta-compressed in packs, as the post prescribes; the server store is
-  several times larger than an aggressively packed git repository.
+* **Storage backend.** The fleet stores data in pebble shards, not Spanner,
+  and shard 0 holds refs and the log rather than a replicated, globally
+  consistent database. Replication and failover of storage nodes are out of
+  scope.
+* **Code review** is a set of approval gates with semantic exemptions and an
+  API, not a review UI like Antique. **Code search** is an unindexed parallel
+  scan.
+* **Virtual checkout** uses loopback NFS rather than a kernel filesystem
+  driver: it needs no extension on macOS, but Linux requires root to mount.
+* **Storage efficiency** is decided entirely at write time. git's offline
+  `gc --aggressive` still packs real repositories 1–6% smaller; graft is
+  smaller than git's default repack with the same hash function.
 
 ## Code map
 
@@ -157,10 +219,13 @@ internal/store/     pebble server store, memory LRU, segment disk cache
 internal/derive/    generic derived-data engine
 internal/repo/      changeset log, derived types, history, blame, renames, rebase/merge/land
 internal/api/       HTTP API server and client
-internal/fetch/     want-only object protocol, tiers, coalescing
+internal/fetch/     want-only object protocol, tiers, coalescing, private objects
 internal/client/    working copy: checkout, sparse, status, commit, land
-internal/vfs/       virtual checkout filesystem (exported over NFS by `gft mount`)
+internal/watch/     filesystem watcher (FSEvents, inotify) and change journal
+internal/vfs/       virtual checkout: lazy filesystem, copy-on-write overlay, mount control
+internal/acl/       access control policy
+internal/review/    change classification for review gates
 internal/gitimport/ git fast-export ingestion
-internal/diff/      Myers diff, diff3 merge, unified output
+internal/diff/      git-compatible diff (xdiff port), diff3 merge, unified output
 bench/              synthetic monorepo generator, benchmark harness, git cross-checks
 ```
