@@ -68,15 +68,15 @@ IDs, so the SHA-256 git columns compare like with like:
 
 | repository | graft | git SHA-1 repack | git SHA-1 aggressive | git SHA-256 repack | git SHA-256 aggressive |
 |---|---:|---:|---:|---:|---:|
-| synthetic monorepo, 20k commits | **96.8 MB** | 113.7 MB | 106.2 MB | 122.6 MB | 115.1 MB |
-| redis/redis, 13k commits | 85.4 MB | 84.1 MB | 80.5 MB | 91.3 MB | 80.9 MB |
-| spf13/cobra, 1.1k commits | 1.51 MB | 1.60 MB | 1.48 MB | 1.61 MB | 1.49 MB |
+| synthetic monorepo, 20k commits | **96.0 MB** | 113.7 MB | 106.2 MB | 122.6 MB | 115.1 MB |
+| redis/redis, 13k commits | **83.8 MB** | 84.1 MB | 80.5 MB | 91.3 MB | 80.9 MB |
+| spf13/cobra, 1.1k commits | **1.47 MB** | 1.60 MB | 1.48 MB | 1.61 MB | 1.49 MB |
 
 That table also holds graft's history indexes: per-path history, the commit
-graph, and rename sources. With like-for-like hashes, graft is smaller than
-git's repack on all three repositories and smaller than `gc --aggressive` on
-the monorepo. On the two real repositories, `gc --aggressive` (an offline,
-minutes-long repack) is 1–6% smaller.
+graph, and rename sources. graft is smaller than git's repack on all three
+repositories (SHA-1 or SHA-256). It is also smaller than `gc --aggressive`
+on cobra and the monorepo. On redis, `gc --aggressive` (an offline,
+minutes-long repack) is 4% smaller.
 
 **Correctness checks** that run with the benchmarks and tests:
 * every concurrent land is verified present and history linear;

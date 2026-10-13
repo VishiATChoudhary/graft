@@ -134,11 +134,11 @@ testing.
     are small). Keyframes are kept pseudo-randomly with probability
     size/64 MB, bounding the bytes rebuilt to read any version;
   * forward deltas for trees (chains capped at 255);
-  * a zstd **dictionary** trained on the repository's own blobs for full
-    versions, and stronger zstd for blobs too large for it;
+  * zstd **dictionaries** trained on the repository's own blobs and
+    changesets, and stronger zstd for blobs too large for a dictionary;
   * delta bases also come from renames, merges' other parents, deleted
-    files' surviving siblings, and similar new siblings (same extension,
-    closest size);
+    files' surviving siblings or same-named files added in the same
+    changeset, and similar new siblings (same extension, closest size);
   * 16-byte storage keys and base references (2^64 objects to a likely
     collision).
 * **Regional cache**: sharded in-memory LRU, byte-bounded.
@@ -206,9 +206,10 @@ renames are followed. Server-side merges use diff3.
   scan.
 * **Virtual checkout** uses loopback NFS rather than a kernel filesystem
   driver: it needs no extension on macOS, but Linux requires root to mount.
-* **Storage efficiency** is decided entirely at write time. git's offline
-  `gc --aggressive` still packs real repositories 1–6% smaller; graft is
-  smaller than git's default repack with the same hash function.
+* **Storage efficiency** is decided entirely at write time, with no
+  repacking. graft is smaller than git's repack on every repository tested,
+  and smaller than `gc --aggressive` on two of three; on redis/redis the
+  offline aggressive repack is 4% smaller.
 
 ## Code map
 
