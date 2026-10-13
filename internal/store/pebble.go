@@ -70,7 +70,7 @@ const (
 	// Chains are capped so reads stay bounded. Trees and unodes are small
 	// and cheap to rebuild, so their chains can be long (and dense); blobs
 	// are larger, so theirs are shorter (git's default pack depth is 50).
-	maxDeltaDepth     = 128
+	maxDeltaDepth     = 255
 	maxBlobDeltaDepth = 64
 
 	maxChainRead = 1 << 14
@@ -287,7 +287,7 @@ func (d *DB) Payload(id object.ID) (object.Kind, []byte, error) {
 		if err != nil {
 			if len(chain) > 0 && errors.Is(err, object.ErrNotFound) {
 				if d.peers != nil {
-					if info, perr := d.peers(cur); perr == nil {
+					if info, perr := d.peers(cur, false); perr == nil {
 						kind, base = info.Kind, info.Payload
 						d.cachePayload(cur, kind, base)
 						break
@@ -519,7 +519,7 @@ func (d *DB) deltaRecord(id object.ID, k object.Kind, p []byte, base object.ID, 
 	if ok, _ := d.Has(base); ok {
 		info, err = d.localBase(base, existing)
 	} else if d.peers != nil {
-		info, err = d.peers(base)
+		info, err = d.peers(base, existing)
 	} else {
 		return nil
 	}
@@ -774,7 +774,7 @@ func (d *DB) AppendLog(id object.ID) (uint64, error) {
 	seq := d.seq + 1
 	b := d.db.NewBatch()
 	b.Set(key(pfxLog, be64(seq)), id[:], nil)
-	b.Set(key(pfxLogIdx, id[:]), be64(seq), nil)
+	b.Set(key(pfxLogIdx, id[:keyIDLen]), be64(seq), nil)
 	if err := b.Commit(pebble.NoSync); err != nil {
 		return 0, err
 	}
@@ -783,7 +783,7 @@ func (d *DB) AppendLog(id object.ID) (uint64, error) {
 }
 
 func (d *DB) LogSeq(id object.ID) (uint64, error) {
-	v, err := d.get(key(pfxLogIdx, id[:]))
+	v, err := d.get(key(pfxLogIdx, id[:keyIDLen]))
 	if err != nil {
 		return 0, err
 	}
@@ -800,18 +800,25 @@ func (d *DB) LogID(seq uint64) (object.ID, error) {
 	return id, nil
 }
 
-// ScanLogIdxPrefix iterates logged changeset IDs starting with prefix bytes.
+// ScanLogIdxPrefix iterates logged changeset IDs starting with prefix bytes
+// (the index is keyed by the 16-byte storage prefix; full IDs come from the
+// log).
 func (d *DB) ScanLogIdxPrefix(prefix []byte, fn func(id object.ID) bool) error {
+	if len(prefix) > keyIDLen {
+		prefix = prefix[:keyIDLen]
+	}
 	lo := key(pfxLogIdx, prefix)
-	hi := key(pfxLogIdx, prefix, bytes.Repeat([]byte{0xff}, 33-len(prefix)))
+	hi := key(pfxLogIdx, prefix, bytes.Repeat([]byte{0xff}, keyIDLen+1-len(prefix)))
 	it, err := d.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
 	if err != nil {
 		return err
 	}
 	defer it.Close()
 	for it.First(); it.Valid(); it.Next() {
-		var id object.ID
-		copy(id[:], it.Key()[1:])
+		id, err := d.LogID(binary.BigEndian.Uint64(it.Value()))
+		if err != nil {
+			return err
+		}
 		if !fn(id) {
 			break
 		}
@@ -887,8 +894,9 @@ func decodeBaseInfo(b []byte) (*BaseInfo, error) {
 	return info, nil
 }
 
-// BaseResolver finds a delta base stored on another shard, by prefix.
-type BaseResolver func(prefix object.ID) (*BaseInfo, error)
+// BaseResolver finds a delta base stored on another shard, by prefix. The
+// base's own chain (needed only for cycle checks) is included on request.
+type BaseResolver func(prefix object.ID, withChain bool) (*BaseInfo, error)
 
 // SetPeers lets this shard use delta bases stored on peer shards, so
 // storage stays dense when one file's history is spread across shards.
@@ -917,7 +925,7 @@ func (d *DB) localBase(id object.ID, withChain bool) (*BaseInfo, error) {
 			info.Chain = append(info.Chain, c)
 			nb, err := d.raw(cur.base)
 			if errors.Is(err, object.ErrNotFound) && d.peers != nil {
-				pi, err := d.peers(cur.base)
+				pi, err := d.peers(cur.base, true)
 				if err != nil {
 					return nil, err
 				}

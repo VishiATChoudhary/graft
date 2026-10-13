@@ -114,9 +114,12 @@ func (r *Repo) computeCS(id object.ID, parents []object.ID, vals [][]byte) ([]by
 		p1 = ps[0]
 		c.Depth = p1.Depth + 1
 		c.Skips = append(c.Skips, c.Parents[0])
-		// skip[k] = skip[k-1] of skip[k-1]. Ancestors are always derived
-		// before descendants, so these lookups never recurse deeply.
-		for k := 1; uint64(1)<<k <= c.Depth; k++ {
+		// Deterministic skip list: a changeset at first-parent depth d keeps
+		// skips 2^k back only for 2^k dividing d (about two per changeset
+		// on average), which still allows O(log n) jumps. skip[k] is
+		// skip[k-1] of skip[k-1]; that ancestor's depth is divisible by
+		// 2^(k-1), so it has the pointer needed.
+		for k := 1; uint64(1)<<k <= c.Depth && c.Depth%(uint64(1)<<k) == 0; k++ {
 			mid, err := r.graphAtSeq(c.Skips[k-1])
 			if err != nil {
 				return nil, err

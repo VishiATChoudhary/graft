@@ -412,25 +412,30 @@ func urlEscape(s string) string {
 func PeerResolver(nodes []string, self int, db *DB) BaseResolver {
 	client := &http.Client{Timeout: time.Minute, Transport: &http.Transport{
 		MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, DisableCompression: true}}
-	return func(prefix object.ID) (*BaseInfo, error) {
+	return func(prefix object.ID, withChain bool) (*BaseInfo, error) {
 		i := ShardOf(prefix, len(nodes))
 		if i == self {
-			return db.localBase(prefix, true)
+			return db.localBase(prefix, withChain)
 		}
-		resp, err := client.Get(strings.TrimRight(nodes[i], "/") + "/kv/base?chain=1&p=" + hex.EncodeToString(prefix[:keyIDLen]))
+		chain := "0"
+		if withChain {
+			chain = "1"
+		}
+		resp, err := client.Get(strings.TrimRight(nodes[i], "/") + "/kv/base?chain=" + chain + "&p=" + hex.EncodeToString(prefix[:keyIDLen]))
 		if err != nil {
 			return nil, err
 		}
 		defer resp.Body.Close()
+		// Always read to EOF so the connection is reused.
+		b, err := io.ReadAll(bufio.NewReader(resp.Body))
+		if err != nil {
+			return nil, err
+		}
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, object.ErrNotFound
 		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("peer %d: %s", i, resp.Status)
-		}
-		b, err := io.ReadAll(bufio.NewReader(resp.Body))
-		if err != nil {
-			return nil, err
 		}
 		return decodeBaseInfo(b)
 	}

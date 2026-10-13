@@ -2,6 +2,7 @@ package object
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -172,7 +173,35 @@ type Changeset struct {
 	Origin string `json:"origin,omitempty"`
 }
 
-const changesetVersion = 1
+const changesetVersion = 2
+
+// Origins of the form "git:<40 hex>" (imports) are stored as 20 bytes.
+const gitOriginPrefix = "git:"
+
+func encodeOrigin(e *Encoder, o string) {
+	if h, ok := strings.CutPrefix(o, gitOriginPrefix); ok && len(h) == 40 {
+		if raw, err := hex.DecodeString(h); err == nil && hex.EncodeToString(raw) == h {
+			e.Byte(1)
+			e.B = append(e.B, raw...)
+			return
+		}
+	}
+	e.Byte(0)
+	e.String(o)
+}
+
+func decodeOrigin(d *Decoder) string {
+	if d.Byte() == 1 {
+		if d.Err != nil || len(d.B) < 20 {
+			d.fail("origin")
+			return ""
+		}
+		o := gitOriginPrefix + hex.EncodeToString(d.B[:20])
+		d.B = d.B[20:]
+		return o
+	}
+	return d.String()
+}
 
 func (c *Changeset) Encode() []byte {
 	var e Encoder
@@ -185,7 +214,7 @@ func (c *Changeset) Encode() []byte {
 	e.Varint(c.Time)
 	e.Varint(int64(c.TZ))
 	e.String(c.Message)
-	e.String(c.Origin)
+	encodeOrigin(&e, c.Origin)
 	e.Uvarint(uint64(len(c.Changes)))
 	for _, ch := range c.Changes {
 		e.String(ch.Path)
@@ -214,7 +243,7 @@ func DecodeChangeset(b []byte) (*Changeset, error) {
 	c.Time = d.Varint()
 	c.TZ = int32(d.Varint())
 	c.Message = d.String()
-	c.Origin = d.String()
+	c.Origin = decodeOrigin(&d)
 	nc := d.Uvarint()
 	if d.Err == nil && nc > uint64(len(b)) {
 		return nil, fmt.Errorf("%w: change count", ErrCorrupt)
