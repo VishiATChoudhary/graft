@@ -121,7 +121,7 @@ func Open(root string) (*Worktree, error) {
 			return nil, err
 		}
 		w.cache = c
-		w.src = fetch.NewTier(c, fetch.NewRemote(up))
+		w.src = fetch.NewTier(store.KindFilter{Objects: c, Kinds: []object.Kind{object.KindTree}}, fetch.NewRemote(up))
 	}
 	return w, nil
 }

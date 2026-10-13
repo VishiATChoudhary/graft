@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/VishiATChoudhary/graft/internal/api"
@@ -83,6 +84,7 @@ func (w *Worktree) Commit(ctx context.Context, message string, paths []string) (
 	for _, s := range st {
 		if s.State == 'D' {
 			delete(idx, s.Path)
+			pruneEmpty(filepath.Dir(w.abs(s.Path)), w.Root)
 			continue
 		}
 		info, err := os.Lstat(w.abs(s.Path))
@@ -90,11 +92,6 @@ func (w *Worktree) Commit(ctx context.Context, message string, paths []string) (
 			return object.Zero, nil, err
 		}
 		idx[s.Path] = &IndexEntry{Mode: s.Mode, Size: info.Size(), Mtime: info.ModTime().UnixNano(), Blob: s.Blob}
-		if w.cache != nil {
-			if b, err := mem.Get(s.Blob); err == nil {
-				w.cache.Put(s.Blob, b)
-			}
-		}
 	}
 	w.Head.Changeset, w.Head.Root = resp.ID, resp.Root
 	if err := w.SaveIndex(idx); err != nil {

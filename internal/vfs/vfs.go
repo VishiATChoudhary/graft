@@ -279,18 +279,18 @@ func (f *FS) Capabilities() billy.Capability {
 	return billy.ReadCapability | billy.SeekCapability
 }
 
-func (f *FS) Create(string) (billy.File, error)         { return nil, errReadOnly }
-func (f *FS) Rename(string, string) error                { return errReadOnly }
-func (f *FS) Remove(string) error                        { return errReadOnly }
+func (f *FS) Create(string) (billy.File, error)           { return nil, errReadOnly }
+func (f *FS) Rename(string, string) error                 { return errReadOnly }
+func (f *FS) Remove(string) error                         { return errReadOnly }
 func (f *FS) TempFile(string, string) (billy.File, error) { return nil, errReadOnly }
-func (f *FS) MkdirAll(string, os.FileMode) error         { return errReadOnly }
-func (f *FS) Symlink(string, string) error               { return errReadOnly }
+func (f *FS) MkdirAll(string, os.FileMode) error          { return errReadOnly }
+func (f *FS) Symlink(string, string) error                { return errReadOnly }
 
 // billy.Change, for setattr: reject everything.
-func (f *FS) Chmod(string, os.FileMode) error              { return errReadOnly }
-func (f *FS) Lchown(string, int, int) error                { return errReadOnly }
-func (f *FS) Chown(string, int, int) error                 { return errReadOnly }
-func (f *FS) Chtimes(string, time.Time, time.Time) error   { return errReadOnly }
+func (f *FS) Chmod(string, os.FileMode) error            { return errReadOnly }
+func (f *FS) Lchown(string, int, int) error              { return errReadOnly }
+func (f *FS) Chown(string, int, int) error               { return errReadOnly }
+func (f *FS) Chtimes(string, time.Time, time.Time) error { return errReadOnly }
 
 type file struct {
 	fs   *FS

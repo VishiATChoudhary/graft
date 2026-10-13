@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,13 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if prof := os.Getenv("GFT_CPUPROFILE"); prof != "" {
+		f, perr := os.Create(prof)
+		if perr == nil {
+			pprof.StartCPUProfile(f)
+			defer pprof.StopCPUProfile()
+		}
+	}
 	var err error
 	switch cmd {
 	case "serve":
@@ -133,6 +141,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "gft: %v\n", err)
+		pprof.StopCPUProfile()
 		os.Exit(1)
 	}
 }

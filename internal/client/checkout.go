@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 
 	"github.com/VishiATChoudhary/graft/internal/object"
@@ -215,22 +216,23 @@ func (w *Worktree) writeBlobs(ctx context.Context, jobs map[object.ID]*blobJob, 
 		id      object.ID
 		content []byte
 	}
-	writes := make(chan write, 1024)
+	// Each directory is owned by one writer, so concurrent creates do not
+	// contend on the same directory lock.
+	nw := writers()
+	queues := make([]chan write, nw)
 	var werr error
 	var wwg sync.WaitGroup
-	for i := 0; i < runtime.GOMAXPROCS(0)*2; i++ {
+	for i := 0; i < nw; i++ {
+		queues[i] = make(chan write, 256)
 		wwg.Add(1)
-		go func() {
+		go func(writes chan write) {
 			defer wwg.Done()
 			for wr := range writes {
 				fp := w.abs(wr.path)
 				err := mkdir(filepath.Dir(fp))
-				if err == nil {
-					err = writeFile(fp, wr.mode, wr.content)
-				}
 				var info os.FileInfo
 				if err == nil {
-					info, err = os.Lstat(fp)
+					info, err = writeFile(fp, wr.mode, wr.content)
 				}
 				mu.Lock()
 				if err != nil {
@@ -244,7 +246,7 @@ func (w *Worktree) writeBlobs(ctx context.Context, jobs map[object.ID]*blobJob, 
 				}
 				mu.Unlock()
 			}
-		}()
+		}(queues[i])
 	}
 	ferr := w.parallelFetch(ctx, order, blobBatch, func(id object.ID, stored []byte) error {
 		k, p, err := object.Verify(id, stored)
@@ -256,16 +258,39 @@ func (w *Worktree) writeBlobs(ctx context.Context, jobs map[object.ID]*blobJob, 
 		}
 		j := jobs[id]
 		for i, pth := range j.paths {
-			writes <- write{pth, j.modes[i], id, p}
+			queues[dirShard(pth, nw)] <- write{pth, j.modes[i], id, p}
 		}
 		return nil
 	})
-	close(writes)
+	for _, q := range queues {
+		close(q)
+	}
 	wwg.Wait()
 	if ferr != nil {
 		return ferr
 	}
 	return werr
+}
+
+func dirShard(p string, n int) int {
+	d := path.Dir(p)
+	var h uint32 = 2166136261
+	for i := 0; i < len(d); i++ {
+		h = (h ^ uint32(d[i])) * 16777619
+	}
+	return int(h % uint32(n))
+}
+
+// writers is the number of concurrent file writers. File creation is
+// kernel-bound and contends on directory locks, so more is not better.
+func writers() int {
+	if v, err := strconv.Atoi(os.Getenv("GFT_WRITERS")); err == nil && v > 0 {
+		return v
+	}
+	if runtime.GOOS == "darwin" {
+		return 2 // APFS serializes creates per volume: more writers only burn kernel CPU
+	}
+	return min(runtime.GOMAXPROCS(0), 4)
 }
 
 // removeBlocking removes a file sitting where a directory must go.
@@ -278,30 +303,59 @@ func removeBlocking(dir, root string) error {
 	return errors.New("no blocking file")
 }
 
-func writeFile(fp string, mode object.Mode, content []byte) error {
+// writeFile writes a working-copy file and returns its stat information.
+// The common case (a new file) is open(O_EXCL) + write + fstat + close.
+func writeFile(fp string, mode object.Mode, content []byte) (os.FileInfo, error) {
+	perm := os.FileMode(0o644)
+	if mode == object.ModeExec {
+		perm = 0o755
+	}
+	if mode != object.ModeSymlink {
+		f, err := os.OpenFile(fp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+		if err == nil {
+			_, werr := f.Write(content)
+			var info os.FileInfo
+			if werr == nil {
+				info, werr = f.Stat()
+			}
+			if cerr := f.Close(); werr == nil {
+				werr = cerr
+			}
+			return info, werr
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+	// Something is in the way: replace it.
 	if info, err := os.Lstat(fp); err == nil {
 		if info.IsDir() {
 			if err := os.RemoveAll(fp); err != nil {
-				return err
+				return nil, err
 			}
-		} else if mode == object.ModeSymlink || info.Mode()&fs.ModeSymlink != 0 {
-			os.Remove(fp)
+		} else if err := os.Remove(fp); err != nil {
+			return nil, err
 		}
 	}
-	switch mode {
-	case object.ModeSymlink:
-		return os.Symlink(string(content), fp)
-	case object.ModeExec:
-		if err := os.WriteFile(fp, content, 0o755); err != nil {
-			return err
+	if mode == object.ModeSymlink {
+		if err := os.Symlink(string(content), fp); err != nil {
+			return nil, err
 		}
-		return os.Chmod(fp, 0o755)
-	default:
-		if err := os.WriteFile(fp, content, 0o644); err != nil {
-			return err
-		}
-		return os.Chmod(fp, 0o644)
+		return os.Lstat(fp)
 	}
+	f, err := os.OpenFile(fp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return nil, err
+	}
+	_, werr := f.Write(content)
+	var info os.FileInfo
+	if werr == nil {
+		info, werr = f.Stat()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return info, werr
 }
 
 func (w *Worktree) update(ctx context.Context, from, to string, idx Index, force bool) (*CheckoutStats, error) {
@@ -314,18 +368,12 @@ func (w *Worktree) update(ctx context.Context, from, to string, idx Index, force
 		return st, nil
 	}
 	if !force {
-		changed := map[string]bool{}
-		for _, c := range d.Changes {
-			changed[c.Path] = true
-		}
-		local, err := w.Status(ctx)
-		if err != nil {
-			return st, err
-		}
+		// Only the paths this update touches can be clobbered, so only
+		// they are checked (not the whole working copy).
 		var dirty []string
-		for _, s := range local {
-			if changed[s.Path] {
-				dirty = append(dirty, s.Path)
+		for _, c := range d.Changes {
+			if w.inSparse(c.Path) && w.locallyModified(c.Path, idx) {
+				dirty = append(dirty, c.Path)
 			}
 		}
 		if len(dirty) > 0 {
@@ -358,6 +406,25 @@ func (w *Worktree) update(ctx context.Context, from, to string, idx Index, force
 		j.modes = append(j.modes, c.NewMode)
 	}
 	return st, w.writeBlobs(ctx, jobs, order, idx, st)
+}
+
+// locallyModified reports whether path differs from what the index
+// recorded (including untracked files that a checkout would overwrite).
+func (w *Worktree) locallyModified(p string, idx Index) bool {
+	info, err := os.Lstat(w.abs(p))
+	e := idx[p]
+	if err != nil {
+		return e != nil // deleted locally
+	}
+	if e == nil {
+		return true // untracked file in the way
+	}
+	mode := modeOf(info)
+	if e.Size == info.Size() && e.Mtime == info.ModTime().UnixNano() && e.Mode == mode {
+		return false
+	}
+	content, err := readContent(w.abs(p), mode)
+	return err != nil || object.Hash(object.KindBlob, content) != e.Blob || e.Mode != mode
 }
 
 func pruneEmpty(dir, root string) {

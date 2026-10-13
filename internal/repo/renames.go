@@ -14,7 +14,7 @@ import (
 // once, when unodes are derived, and is recorded as Unode.CopyFrom, so
 // queries never pay for it again.
 const (
-	renameThreshold = 0.5
+	renameThreshold  = 0.5
 	maxRenameInexact = 200     // per side; beyond this only exact renames are found
 	maxRenameSize    = 1 << 20 // files larger than this only match exactly
 	maxDeletedExpand = 10000   // files expanded from a deleted directory

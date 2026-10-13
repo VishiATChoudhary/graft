@@ -20,6 +20,7 @@ import (
 
 	"github.com/VishiATChoudhary/graft/internal/api"
 	"github.com/VishiATChoudhary/graft/internal/fetch"
+	"github.com/VishiATChoudhary/graft/internal/metrics"
 	"github.com/VishiATChoudhary/graft/internal/object"
 	"github.com/VishiATChoudhary/graft/internal/repo"
 	"github.com/VishiATChoudhary/graft/internal/store"
@@ -63,7 +64,7 @@ func cmdServe(args []string) error {
 		mux.HandleFunc("/v1/objects", fetch.Handler(t))
 		mux.HandleFunc("/v1/info", func(w http.ResponseWriter, _ *http.Request) {
 			h, m, b := lru.Stats()
-			json.NewEncoder(w).Encode(map[string]any{"tier": "cache", "hits": h, "misses": m, "bytes": b, "hit_rate": rate(h, m)})
+			json.NewEncoder(w).Encode(map[string]any{"tier": "cache", "hits": h, "misses": m, "bytes": b, "hit_rate": rate(h, m), "cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS()})
 		})
 	case "daemon":
 		if *upstream == "" {
@@ -89,7 +90,7 @@ func cmdServe(args []string) error {
 		mux.HandleFunc("/v1/objects", fetch.Handler(t))
 		mux.HandleFunc("/v1/info", func(w http.ResponseWriter, _ *http.Request) {
 			h, m, b, n := dc.Stats()
-			json.NewEncoder(w).Encode(map[string]any{"tier": "daemon", "hits": h, "misses": m, "bytes": b, "objects": n, "hit_rate": rate(h, m)})
+			json.NewEncoder(w).Encode(map[string]any{"tier": "daemon", "hits": h, "misses": m, "bytes": b, "objects": n, "hit_rate": rate(h, m), "cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS()})
 		})
 	default:
 		return fmt.Errorf("unknown tier %q", *tier)

@@ -60,3 +60,22 @@ func ReadChangeset(s Objects, id object.ID) (*object.Changeset, error) {
 	}
 	return object.DecodeChangeset(p)
 }
+
+// KindFilter stores only objects of the given kinds and drops other writes.
+// A client without a node daemon caches trees but not blobs: blobs are
+// already in the working copy, and are refetched on demand if needed.
+type KindFilter struct {
+	Objects
+	Kinds []object.Kind
+}
+
+func (f KindFilter) Put(id object.ID, stored []byte) error {
+	if len(stored) > 0 {
+		for _, k := range f.Kinds {
+			if object.Kind(stored[0]) == k {
+				return f.Objects.Put(id, stored)
+			}
+		}
+	}
+	return nil
+}

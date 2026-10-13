@@ -18,6 +18,7 @@ import (
 
 	"github.com/VishiATChoudhary/graft/internal/diff"
 	"github.com/VishiATChoudhary/graft/internal/fetch"
+	"github.com/VishiATChoudhary/graft/internal/metrics"
 	"github.com/VishiATChoudhary/graft/internal/object"
 	"github.com/VishiATChoudhary/graft/internal/repo"
 	"github.com/VishiATChoudhary/graft/internal/store"
@@ -227,7 +228,8 @@ func (s *Server) info(r *http.Request) (any, error) {
 	}
 	hits, misses, bytes := s.Repo.DB.HotStats()
 	return map[string]any{"tier": "server", "changesets": s.Repo.LogSize(), "refs": len(refs),
-		"hot_cache": map[string]any{"hits": hits, "misses": misses, "bytes": bytes}}, nil
+		"hot_cache":   map[string]any{"hits": hits, "misses": misses, "bytes": bytes},
+		"cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS()}, nil
 }
 
 func (s *Server) refs(r *http.Request) (any, error) { return s.Repo.Refs() }
