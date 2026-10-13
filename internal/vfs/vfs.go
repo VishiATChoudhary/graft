@@ -36,9 +36,11 @@ type FS struct {
 }
 
 type shared struct {
-	src   fetch.Source
-	root  object.ID
-	mtime time.Time
+	src fetch.Source
+
+	rootMu sync.RWMutex
+	root   object.ID
+	mtime  time.Time
 
 	mu    sync.Mutex
 	trees map[object.ID]*object.Tree
@@ -53,6 +55,19 @@ type shared struct {
 // cache of decompressed file contents.
 func New(src fetch.Source, root object.ID, mtime time.Time, blobCache int64) *FS {
 	return &FS{shared: &shared{src: src, root: root, mtime: mtime, trees: map[object.ID]*object.Tree{}, blobs: store.NewMemLRU(blobCache)}}
+}
+
+// SetRoot switches the revision being served.
+func (s *shared) SetRoot(root object.ID, mtime time.Time) {
+	s.rootMu.Lock()
+	s.root, s.mtime = root, mtime
+	s.rootMu.Unlock()
+}
+
+func (s *shared) current() (object.ID, time.Time) {
+	s.rootMu.RLock()
+	defer s.rootMu.RUnlock()
+	return s.root, s.mtime
 }
 
 // Stats reports how much was fetched lazily.
@@ -124,7 +139,8 @@ func (f *FS) clean(name string) string {
 // lookup resolves a slash path to a tree entry.
 func (f *FS) lookup(name string) (object.TreeEntry, error) {
 	p := f.clean(name)
-	cur := object.TreeEntry{Name: "", Mode: object.ModeDir, ID: f.root}
+	root, _ := f.current()
+	cur := object.TreeEntry{Name: "", Mode: object.ModeDir, ID: root}
 	if p == "" {
 		return cur, nil
 	}
@@ -143,6 +159,11 @@ func (f *FS) lookup(name string) (object.TreeEntry, error) {
 		cur = t.Entries[i]
 	}
 	return cur, nil
+}
+
+func (f *FS) modTime() time.Time {
+	_, t := f.current()
+	return t
 }
 
 type fileInfo struct {
@@ -192,7 +213,7 @@ func (f *FS) Stat(name string) (os.FileInfo, error) {
 			}
 			if te, err := (&FS{shared: f.shared}).lookup(t); err == nil {
 				te.Name = path.Base(name)
-				return fileInfo{te, f.mtime}, nil
+				return fileInfo{te, f.modTime()}, nil
 			}
 		}
 	}
@@ -200,7 +221,7 @@ func (f *FS) Stat(name string) (os.FileInfo, error) {
 	if f.clean(name) == "" {
 		e.Name = ""
 	}
-	return fileInfo{e, f.mtime}, nil
+	return fileInfo{e, f.modTime()}, nil
 }
 
 func (f *FS) Lstat(name string) (os.FileInfo, error) {
@@ -211,7 +232,7 @@ func (f *FS) Lstat(name string) (os.FileInfo, error) {
 	if f.clean(name) != "" {
 		e.Name = path.Base("/" + f.clean(name))
 	}
-	return fileInfo{e, f.mtime}, nil
+	return fileInfo{e, f.modTime()}, nil
 }
 
 func (f *FS) ReadDir(name string) ([]os.FileInfo, error) {
@@ -228,7 +249,7 @@ func (f *FS) ReadDir(name string) ([]os.FileInfo, error) {
 	}
 	out := make([]os.FileInfo, 0, len(t.Entries))
 	for _, en := range t.Entries {
-		out = append(out, fileInfo{en, f.mtime})
+		out = append(out, fileInfo{en, f.modTime()})
 	}
 	return out, nil
 }

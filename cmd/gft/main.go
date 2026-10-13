@@ -23,13 +23,15 @@ import (
 	"github.com/VishiATChoudhary/graft/internal/object"
 	"github.com/VishiATChoudhary/graft/internal/repo"
 	"github.com/VishiATChoudhary/graft/internal/store"
+	"github.com/VishiATChoudhary/graft/internal/vfs"
 )
 
 const usage = `gft: source control for agent-scale monorepos
 
 Working copy:
   gft clone <server> <dir> [--sparse dir]... [--objects endpoint] [--rev main]
-  gft mount <server> <dir> [--rev R]  virtual read-only checkout: files fetched on first read
+  gft mount <server> <dir> [--rev R]  virtual checkout: files fetched on first read, writes go to an
+                                     overlay; status/commit/land/checkout work inside it [--rdonly]
   gft checkout <rev> [--force]       move the working copy (only changed files are touched)
   gft sparse list|add|set <dir>...   change which directories are materialized
   gft watch [--background|--stop]    watch the working copy so status only checks what changed
@@ -221,6 +223,12 @@ func apiClient(server string) (*api.Client, *client.Worktree) {
 	if server != "" {
 		return api.NewClient(server), nil
 	}
+	if mc, _ := vfs.FindMount("."); mc != nil {
+		var h vfs.MountHead
+		if mc.Call("/head", nil, &h) == nil {
+			return api.NewClient(mc.Meta.Server), &client.Worktree{Head: client.Head{Changeset: h.Changeset, Root: h.Root}}
+		}
+	}
 	if wt, err := openWT(); err == nil {
 		return wt.API, wt
 	}
@@ -348,6 +356,15 @@ func cmdCheckout(args []string) error {
 	if len(pos) != 1 {
 		return errors.New("usage: gft checkout <rev>")
 	}
+	if mc, _ := vfs.FindMount("."); mc != nil {
+		start := time.Now()
+		var ci api.ChangesetInfo
+		if err := mc.Call("/checkout", map[string]string{"rev": pos[0], "branch": ""}, &ci); err != nil {
+			return err
+		}
+		fmt.Printf("mount now shows %s (no files written) in %s\n", ci.ID.Short(), time.Since(start).Round(time.Millisecond))
+		return nil
+	}
 	wt, err := openWT()
 	if err != nil {
 		return err
@@ -416,6 +433,25 @@ func cmdSparse(args []string) error {
 }
 
 func cmdStatus(args []string) error {
+	if mc, _ := vfs.FindMount("."); mc != nil {
+		var h vfs.MountHead
+		if err := mc.Call("/head", nil, &h); err != nil {
+			return err
+		}
+		var st []vfs.FileState
+		if err := mc.Call("/status", nil, &st); err != nil {
+			return err
+		}
+		branch := h.Branch
+		if branch == "" {
+			branch = "(detached)"
+		}
+		fmt.Printf("at %s on %s (virtual mount)\n", h.Changeset.Short(), branch)
+		for _, s := range st {
+			fmt.Printf("%s %s\n", s.State, s.Path)
+		}
+		return nil
+	}
 	wt, err := openWT()
 	if err != nil {
 		return err
@@ -442,6 +478,21 @@ func cmdCommit(args []string) error {
 	paths := parse(fs, args)
 	if *msg == "" {
 		return errors.New("commit message required (-m)")
+	}
+	if mc, _ := vfs.FindMount("."); mc != nil {
+		var out struct {
+			ID    object.ID
+			Paths int
+		}
+		start := time.Now()
+		if err := mc.Call("/commit", map[string]string{"message": *msg}, &out); err != nil {
+			return err
+		}
+		fmt.Printf("created %s (%d paths) in %s\n", out.ID.Short(), out.Paths, time.Since(start).Round(time.Millisecond))
+		if *land != "" {
+			return mountLand(mc, *land)
+		}
+		return nil
 	}
 	wt, err := openWT()
 	if err != nil {
@@ -477,10 +528,27 @@ func doLand(wt *client.Worktree, ref string) error {
 	return nil
 }
 
+func mountLand(mc *vfs.MountClient, ref string) error {
+	start := time.Now()
+	var res repo.LandResult
+	if err := mc.Call("/land", map[string]string{"ref": ref}, &res); err != nil {
+		return err
+	}
+	if ref == "" {
+		ref = "tracked branch"
+	}
+	fmt.Printf("landed on %s: %s -> %s (%d rebased, %d attempt(s)) in %s; mount now shows %s\n", ref, res.Old.Short(), res.New.Short(),
+		res.Rebased, res.Attempts, time.Since(start).Round(time.Millisecond), res.New.Short())
+	return nil
+}
+
 func cmdLand(args []string) error {
 	fs := flag.NewFlagSet("land", flag.ExitOnError)
 	ref := fs.String("ref", "", "ref to land onto (default: tracked branch or main)")
 	parse(fs, args)
+	if mc, _ := vfs.FindMount("."); mc != nil {
+		return mountLand(mc, *ref)
+	}
 	wt, err := openWT()
 	if err != nil {
 		return err
