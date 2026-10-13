@@ -4,9 +4,11 @@ go 1.25.0
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/fsnotify/fsevents v0.2.0
 	github.com/go-git/go-billy/v5 v5.9.2
 	github.com/klauspost/compress v1.20.3
 	github.com/willscott/go-nfs v0.0.4
+	golang.org/x/sys v0.46.0
 )
 
 require (
@@ -36,7 +38,6 @@ require (
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 )

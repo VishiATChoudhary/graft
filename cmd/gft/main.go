@@ -32,6 +32,7 @@ Working copy:
   gft mount <server> <dir> [--rev R]  virtual read-only checkout: files fetched on first read
   gft checkout <rev> [--force]       move the working copy (only changed files are touched)
   gft sparse list|add|set <dir>...   change which directories are materialized
+  gft watch [--background|--stop]    watch the working copy so status only checks what changed
   gft status                         local modifications
   gft diff [path...]                 local modifications as a patch
   gft commit -m <msg> [path...]      create a changeset on the server (nothing to push)
@@ -89,6 +90,8 @@ func main() {
 		err = cmdClone(args)
 	case "mount":
 		err = cmdMount(args)
+	case "watch":
+		err = cmdWatch(args)
 	case "checkout", "co":
 		err = cmdCheckout(args)
 	case "sparse":

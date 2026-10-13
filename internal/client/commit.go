@@ -21,6 +21,7 @@ var ErrNothingToCommit = errors.New("nothing to commit")
 // trees and the changeset. There is nothing to push afterwards.
 // If paths is non-empty only those paths are committed.
 func (w *Worktree) Commit(ctx context.Context, message string, paths []string) (object.ID, []FileStatus, error) {
+	tok := w.watchToken()
 	st, err := w.Status(ctx)
 	if err != nil {
 		return object.Zero, nil, err
@@ -96,6 +97,10 @@ func (w *Worktree) Commit(ctx context.Context, message string, paths []string) (
 	w.Head.Changeset, w.Head.Root = resp.ID, resp.Root
 	if err := w.SaveIndex(idx); err != nil {
 		return object.Zero, nil, err
+	}
+	if len(paths) == 0 {
+		// Everything changed before tok is now committed and indexed.
+		w.saveWatchToken(tok)
 	}
 	return resp.ID, st, w.SaveHead()
 }

@@ -44,14 +44,22 @@ func (w *Worktree) Checkout(ctx context.Context, rev string, force bool) (*Check
 	if err != nil {
 		return nil, err
 	}
+	tok := w.watchToken() // the index will be current as of this point
 	idx, err := w.LoadIndex()
 	if err != nil {
 		return nil, err
 	}
 	var st *CheckoutStats
+	// The watcher token may only advance if the index will reflect every
+	// change made before it: a fresh checkout, or a clean working copy.
+	advance := false
 	if w.Head.Changeset.IsZero() || len(idx) == 0 {
+		advance = true
 		st, err = w.materialize(ctx, ci.Root, idx)
 	} else {
+		if local, ok := w.watchedStatus(idx); ok && len(local) == 0 {
+			advance = true
+		}
 		st, err = w.update(ctx, w.Head.Changeset.String(), ci.ID.String(), idx, force)
 	}
 	if err != nil {
@@ -60,6 +68,9 @@ func (w *Worktree) Checkout(ctx context.Context, rev string, force bool) (*Check
 	w.Head.Changeset, w.Head.Root = ci.ID, ci.Root
 	if err := w.SaveIndex(idx); err != nil {
 		return st, err
+	}
+	if advance {
+		w.saveWatchToken(tok)
 	}
 	return st, w.SaveHead()
 }

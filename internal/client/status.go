@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -13,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/VishiATChoudhary/graft/internal/object"
+	"github.com/VishiATChoudhary/graft/internal/watch"
 )
 
 // FileStatus is one locally modified path.
@@ -148,11 +150,17 @@ func readContent(fp string, mode object.Mode) ([]byte, error) {
 
 // Status reports local modifications relative to the index. Files whose
 // size and mtime match the index are assumed clean; others are hashed.
+// When a watcher (gft watch) is running, only paths it saw change since
+// the index was written are examined.
 func (w *Worktree) Status(ctx context.Context) ([]FileStatus, error) {
 	idx, err := w.LoadIndex()
 	if err != nil {
 		return nil, err
 	}
+	if st, ok := w.watchedStatus(idx); ok {
+		return st, nil
+	}
+	tok := w.watchToken()
 	files, err := w.walk()
 	if err != nil {
 		return nil, err
@@ -205,5 +213,115 @@ func (w *Worktree) Status(ctx context.Context) ([]FileStatus, error) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	if len(out) == 0 && tok != "" {
+		w.saveWatchToken(tok) // clean as of tok: later queries can start here
+	}
 	return out, nil
+}
+
+// watchToken returns the watcher's current position, or "" without one.
+func (w *Worktree) watchToken() string {
+	c := watch.Dial(w.Root)
+	if c == nil {
+		return ""
+	}
+	tok, err := c.Token()
+	if err != nil {
+		if os.Getenv("GFT_WATCH_DEBUG") != "" {
+			fmt.Fprintln(os.Stderr, "watch token:", err)
+		}
+		return ""
+	}
+	return tok
+}
+
+// saveWatchToken records the position the index is current as of.
+func (w *Worktree) saveWatchToken(tok string) {
+	p := meta(w.Root, "fsmonitor")
+	if tok == "" {
+		os.Remove(p)
+		return
+	}
+	os.WriteFile(p, []byte(tok), 0o644)
+}
+
+// watchedStatus computes status from the watcher's change journal.
+func (w *Worktree) watchedStatus(idx Index) ([]FileStatus, bool) {
+	tok, err := os.ReadFile(meta(w.Root, "fsmonitor"))
+	if err != nil {
+		return nil, false
+	}
+	c := watch.Dial(w.Root)
+	if c == nil {
+		return nil, false
+	}
+	ch, err := c.Since(strings.TrimSpace(string(tok)))
+	if err != nil || ch.Full {
+		return nil, false
+	}
+	ig := loadIgnore(w.Root)
+	cand := map[string]bool{}
+	for _, p := range ch.Paths {
+		if dir, ok := strings.CutSuffix(p, "/"); ok {
+			// A directory appeared, vanished or moved: rescan it.
+			filepath.WalkDir(w.abs(dir), func(fp string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				rel, _ := filepath.Rel(w.Root, fp)
+				rel = filepath.ToSlash(rel)
+				if d.IsDir() {
+					if ig.match(rel, true) {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				cand[rel] = true
+				return nil
+			})
+			for ip := range idx {
+				if strings.HasPrefix(ip, dir+"/") {
+					cand[ip] = true
+				}
+			}
+			continue
+		}
+		cand[p] = true
+	}
+	var out []FileStatus
+	for p := range cand {
+		if !w.inSparse(p) || ig.match(p, false) {
+			continue
+		}
+		info, err := os.Lstat(w.abs(p))
+		e := idx[p]
+		if err != nil {
+			if e != nil {
+				out = append(out, FileStatus{Path: p, State: 'D', Mode: e.Mode})
+			}
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		mode := modeOf(info)
+		if e != nil && e.Size == info.Size() && e.Mtime == info.ModTime().UnixNano() && e.Mode == mode {
+			continue
+		}
+		content, err := readContent(w.abs(p), mode)
+		if err != nil {
+			continue
+		}
+		id := object.Hash(object.KindBlob, content)
+		state := byte('A')
+		if e != nil {
+			if e.Blob == id && e.Mode == mode {
+				continue
+			}
+			state = 'M'
+		}
+		out = append(out, FileStatus{Path: p, State: state, Mode: mode, Blob: id, Size: info.Size(), Mtime: info.ModTime().UnixNano()})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, true
 }
