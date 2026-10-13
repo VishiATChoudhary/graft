@@ -226,7 +226,8 @@ type LandResult struct {
 // (or merged, if it is not a simple stack) and the ref is updated with a
 // compare-and-swap. There is no global lock or merge queue: concurrent
 // lands race on the CAS of a single ref and the loser simply retries.
-func (r *Repo) Land(ref string, head object.ID, author string, when int64, maxAttempts int) (*LandResult, error) {
+// check, if set, may veto moving the ref from old to new (authorization).
+func (r *Repo) Land(ref string, head object.ID, author string, when int64, maxAttempts int, check ...func(old, new object.ID) error) (*LandResult, error) {
 	if maxAttempts <= 0 {
 		maxAttempts = 64
 	}
@@ -267,6 +268,11 @@ func (r *Repo) Land(ref string, head object.ID, author string, when int64, maxAt
 					}
 					res.Merged = true
 				}
+			}
+		}
+		for _, c := range check {
+			if err := c(tip, target); err != nil {
+				return nil, err
 			}
 		}
 		err = r.UpdateRef(ref, tip, target)

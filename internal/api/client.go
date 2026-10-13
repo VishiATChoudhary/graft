@@ -25,6 +25,19 @@ type Client struct {
 
 func NewClient(endpoint string) *Client { return &Client{fetch.NewRemote(endpoint)} }
 
+// NewClientToken returns a client that authenticates with a bearer token.
+func NewClientToken(endpoint, token string) *Client {
+	c := NewClient(endpoint)
+	c.Token = token
+	return c
+}
+
+func (c *Client) auth(req *http.Request) {
+	if a := c.Authorization(req.Context()); a != "" {
+		req.Header.Set("Authorization", a)
+	}
+}
+
 // APIError carries the server's status and message.
 type APIError struct {
 	Status    int
@@ -42,9 +55,14 @@ func (e *APIError) Unwrap() error {
 		return repo.ErrStaleRef
 	case http.StatusNotFound:
 		return object.ErrNotFound
+	case http.StatusForbidden, http.StatusUnauthorized:
+		return ErrForbidden
 	}
 	return nil
 }
+
+// ErrForbidden is returned when the caller lacks permission.
+var ErrForbidden = errors.New("permission denied")
 
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body any, out any) error {
 	var rd io.Reader
@@ -63,6 +81,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	if err != nil {
 		return err
 	}
+	c.auth(req)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -223,6 +242,7 @@ func (c *Client) Missing(ctx context.Context, ids []object.ID) ([]object.ID, err
 		if err != nil {
 			return nil, err
 		}
+		c.auth(req)
 		resp, err := c.HTTPClient().Do(req)
 		if err != nil {
 			return nil, err
@@ -276,6 +296,7 @@ func (c *Client) PutObjects(ctx context.Context, src store.Objects, ids []object
 		if err != nil {
 			return err
 		}
+		c.auth(req)
 		resp, err := c.HTTPClient().Do(req)
 		if err != nil {
 			pr.CloseWithError(err)

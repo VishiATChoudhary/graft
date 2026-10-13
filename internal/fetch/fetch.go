@@ -35,7 +35,14 @@ import (
 	"github.com/VishiATChoudhary/graft/internal/store"
 )
 
-const missingLen = 0xFFFFFFFF
+const (
+	missingLen   = 0xFFFFFFFF
+	forbiddenLen = 0xFFFFFFFE
+	// privateBit marks an object the server considers access-controlled:
+	// shared tiers pass it through but never cache it, so every request
+	// for it reaches the server with the caller's credentials.
+	privateBit = 0x80000000
+)
 
 // MaxBatch is the largest number of IDs accepted per request.
 const MaxBatch = 1 << 16
@@ -55,12 +62,57 @@ func (e *MissingError) Error() string {
 
 func (e *MissingError) Unwrap() error { return object.ErrNotFound }
 
-// StoreSource serves directly from a store with no upstream (the
-// authoritative server tier).
-type StoreSource struct{ Store store.Objects }
+// ForbiddenError lists objects the caller may not read.
+type ForbiddenError struct{ IDs []object.ID }
 
-func (s StoreSource) Fetch(_ context.Context, ids []object.ID, fn func(object.ID, []byte) error) error {
-	var missing []object.ID
+func (e *ForbiddenError) Error() string {
+	return fmt.Sprintf("%d object(s) forbidden (first %s)", len(e.IDs), e.IDs[0].Short())
+}
+
+// FlagSource is implemented by sources that report which objects are
+// private (access-controlled) so caching tiers can avoid caching them.
+type FlagSource interface {
+	FetchFlags(ctx context.Context, ids []object.ID, fn func(id object.ID, stored []byte, private bool) error) error
+}
+
+type authKey struct{}
+
+// WithAuth attaches the caller's Authorization header value to ctx; tiers
+// forward it upstream.
+func WithAuth(ctx context.Context, auth string) context.Context {
+	if auth == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, authKey{}, auth)
+}
+
+// AuthFrom returns the Authorization value carried by ctx.
+func AuthFrom(ctx context.Context) string {
+	s, _ := ctx.Value(authKey{}).(string)
+	return s
+}
+
+func fetchFlags(src Source, ctx context.Context, ids []object.ID, fn func(object.ID, []byte, bool) error) error {
+	if fs, ok := src.(FlagSource); ok {
+		return fs.FetchFlags(ctx, ids, fn)
+	}
+	return src.Fetch(ctx, ids, func(id object.ID, b []byte) error { return fn(id, b, false) })
+}
+
+// StoreSource serves directly from a store with no upstream (the
+// authoritative server tier). Guard, if set, decides per object whether the
+// caller may read it and whether it is private.
+type StoreSource struct {
+	Store store.Objects
+	Guard func(ctx context.Context, id object.ID, stored []byte) (allowed, private bool)
+}
+
+func (s StoreSource) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []byte) error) error {
+	return s.FetchFlags(ctx, ids, func(id object.ID, b []byte, _ bool) error { return fn(id, b) })
+}
+
+func (s StoreSource) FetchFlags(ctx context.Context, ids []object.ID, fn func(object.ID, []byte, bool) error) error {
+	var missing, forbidden []object.ID
 	for _, id := range ids {
 		b, err := s.Store.Get(id)
 		if errors.Is(err, object.ErrNotFound) {
@@ -70,9 +122,20 @@ func (s StoreSource) Fetch(_ context.Context, ids []object.ID, fn func(object.ID
 		if err != nil {
 			return err
 		}
-		if err := fn(id, b); err != nil {
+		private := false
+		if s.Guard != nil {
+			var ok bool
+			if ok, private = s.Guard(ctx, id, b); !ok {
+				forbidden = append(forbidden, id)
+				continue
+			}
+		}
+		if err := fn(id, b, private); err != nil {
 			return err
 		}
+	}
+	if len(forbidden) > 0 {
+		return &ForbiddenError{forbidden}
 	}
 	if len(missing) > 0 {
 		return &MissingError{missing}
@@ -83,31 +146,43 @@ func (s StoreSource) Fetch(_ context.Context, ids []object.ID, fn func(object.ID
 // Tier is a caching tier: a local store in front of exactly one upstream.
 // Concurrent requests for the same missing object are coalesced into one
 // upstream fetch, so a burst of jobs on a node (or nodes in a region)
-// produces a single upstream read per object.
+// produces a single upstream read per object. Private objects are passed
+// through without caching, and in-flight fetches are only shared between
+// callers presenting the same credentials.
 type Tier struct {
 	Local    store.Objects
 	Upstream Source
 
 	mu       sync.Mutex
-	inflight map[object.ID]*call
+	inflight map[flightKey]*call
+}
+
+type flightKey struct {
+	id   object.ID
+	auth string
 }
 
 type call struct {
-	done chan struct{}
-	data []byte
-	err  error
+	done    chan struct{}
+	data    []byte
+	private bool
+	err     error
 }
 
 func NewTier(local store.Objects, upstream Source) *Tier {
-	return &Tier{Local: local, Upstream: upstream, inflight: map[object.ID]*call{}}
+	return &Tier{Local: local, Upstream: upstream, inflight: map[flightKey]*call{}}
 }
 
 func (t *Tier) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []byte) error) error {
+	return t.FetchFlags(ctx, ids, func(id object.ID, b []byte, _ bool) error { return fn(id, b) })
+}
+
+func (t *Tier) FetchFlags(ctx context.Context, ids []object.ID, fn func(object.ID, []byte, bool) error) error {
 	var misses []object.ID
 	for _, id := range ids {
 		b, err := t.Local.Get(id)
 		if err == nil {
-			if err := fn(id, b); err != nil {
+			if err := fn(id, b, false); err != nil {
 				return err
 			}
 			continue
@@ -120,6 +195,7 @@ func (t *Tier) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []
 	if len(misses) == 0 {
 		return nil
 	}
+	auth := AuthFrom(ctx)
 	waits := make(map[object.ID]*call, len(misses))
 	var mine []object.ID
 	t.mu.Lock()
@@ -127,10 +203,11 @@ func (t *Tier) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []
 		if _, dup := waits[id]; dup {
 			continue
 		}
-		c, ok := t.inflight[id]
+		k := flightKey{id, auth}
+		c, ok := t.inflight[k]
 		if !ok {
 			c = &call{done: make(chan struct{})}
-			t.inflight[id] = c
+			t.inflight[k] = c
 			mine = append(mine, id)
 		}
 		waits[id] = c
@@ -138,9 +215,9 @@ func (t *Tier) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []
 	t.mu.Unlock()
 
 	if len(mine) > 0 {
-		t.fetchUpstream(ctx, mine, waits)
+		t.fetchUpstream(ctx, mine, auth)
 	}
-	var missing []object.ID
+	var missing, forbidden []object.ID
 	for _, id := range misses {
 		c := waits[id]
 		if c == nil {
@@ -153,15 +230,23 @@ func (t *Tier) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []
 		}
 		delete(waits, id)
 		if c.err != nil {
-			if errors.Is(c.err, object.ErrNotFound) {
+			var fe *ForbiddenError
+			switch {
+			case errors.As(c.err, &fe):
+				forbidden = append(forbidden, id)
+				continue
+			case errors.Is(c.err, object.ErrNotFound):
 				missing = append(missing, id)
 				continue
 			}
 			return c.err
 		}
-		if err := fn(id, c.data); err != nil {
+		if err := fn(id, c.data, c.private); err != nil {
 			return err
 		}
+	}
+	if len(forbidden) > 0 {
+		return &ForbiddenError{forbidden}
 	}
 	if len(missing) > 0 {
 		return &MissingError{missing}
@@ -169,41 +254,55 @@ func (t *Tier) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []
 	return nil
 }
 
-func (t *Tier) fetchUpstream(ctx context.Context, ids []object.ID, calls map[object.ID]*call) {
-	finish := func(id object.ID, data []byte, err error) {
+func (t *Tier) fetchUpstream(ctx context.Context, ids []object.ID, auth string) {
+	finish := func(id object.ID, data []byte, private bool, err error) {
 		t.mu.Lock()
-		c := t.inflight[id]
-		delete(t.inflight, id)
+		k := flightKey{id, auth}
+		c := t.inflight[k]
+		delete(t.inflight, k)
 		t.mu.Unlock()
 		if c != nil {
-			c.data, c.err = data, err
+			c.data, c.private, c.err = data, private, err
 			close(c.done)
 		}
 	}
 	got := make(map[object.ID]bool, len(ids))
-	err := t.Upstream.Fetch(ctx, ids, func(id object.ID, b []byte) error {
+	err := fetchFlags(t.Upstream, ctx, ids, func(id object.ID, b []byte, private bool) error {
 		if got[id] {
 			return nil
 		}
 		got[id] = true
-		_ = t.Local.Put(id, b)
-		finish(id, b, nil)
+		if !private {
+			_ = t.Local.Put(id, b)
+		}
+		finish(id, b, private, nil)
 		return nil
 	})
 	var me *MissingError
+	var fe *ForbiddenError
+	forbidden := map[object.ID]bool{}
+	if errors.As(err, &fe) {
+		for _, id := range fe.IDs {
+			forbidden[id] = true
+		}
+	}
 	for _, id := range ids {
 		if got[id] {
 			continue
 		}
 		e := err
-		if e == nil || errors.As(err, &me) {
+		switch {
+		case forbidden[id]:
+			e = &ForbiddenError{[]object.ID{id}}
+		case e == nil || errors.As(err, &me) || errors.As(err, &fe):
 			e = object.ErrNotFound
 		}
-		finish(id, nil, e)
+		finish(id, nil, false, e)
 	}
 }
 
-// Handler serves the objects RPC from a Source.
+// Handler serves the objects RPC from a Source. The caller's Authorization
+// header is carried to upstream tiers.
 func Handler(src Source) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
@@ -219,22 +318,35 @@ func Handler(src Source) http.HandlerFunc {
 		for i := range ids {
 			copy(ids[i][:], body[i*32:])
 		}
+		ctx := WithAuth(req.Context(), req.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/x-graft-objects")
 		bw := bufio.NewWriterSize(w, 256<<10)
 		var hdr [36]byte
-		err = src.Fetch(req.Context(), ids, func(id object.ID, b []byte) error {
+		marker := func(id object.ID, n uint32) {
 			copy(hdr[:32], id[:])
-			binary.BigEndian.PutUint32(hdr[32:], uint32(len(b)))
+			binary.BigEndian.PutUint32(hdr[32:], n)
 			bw.Write(hdr[:])
+		}
+		err = fetchFlags(src, ctx, ids, func(id object.ID, b []byte, private bool) error {
+			n := uint32(len(b))
+			if private {
+				n |= privateBit
+			}
+			marker(id, n)
 			_, err := bw.Write(b)
 			return err
 		})
 		var me *MissingError
-		if errors.As(err, &me) {
+		var fe *ForbiddenError
+		switch {
+		case errors.As(err, &fe):
+			for _, id := range fe.IDs {
+				marker(id, forbiddenLen)
+			}
+			err = nil
+		case errors.As(err, &me):
 			for _, id := range me.IDs {
-				copy(hdr[:32], id[:])
-				binary.BigEndian.PutUint32(hdr[32:], missingLen)
-				bw.Write(hdr[:])
+				marker(id, missingLen)
 			}
 			err = nil
 		}
@@ -252,6 +364,9 @@ func Handler(src Source) http.HandlerFunc {
 type Remote struct {
 	base   string
 	client *http.Client
+	// Token is sent as a bearer token when the request context carries no
+	// forwarded credentials.
+	Token string
 	// Retries bounds attempts per batch; each retry requests only the
 	// objects not yet received.
 	Retries int
@@ -283,6 +398,10 @@ func (r *Remote) HTTPClient() *http.Client { return r.client }
 func (r *Remote) Base() string { return r.base }
 
 func (r *Remote) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, []byte) error) error {
+	return r.FetchFlags(ctx, ids, func(id object.ID, b []byte, _ bool) error { return fn(id, b) })
+}
+
+func (r *Remote) FetchFlags(ctx context.Context, ids []object.ID, fn func(object.ID, []byte, bool) error) error {
 	for start := 0; start < len(ids); start += MaxBatch {
 		end := min(start+MaxBatch, len(ids))
 		if err := r.fetchBatch(ctx, ids[start:end], fn); err != nil {
@@ -292,19 +411,34 @@ func (r *Remote) Fetch(ctx context.Context, ids []object.ID, fn func(object.ID, 
 	return nil
 }
 
-func (r *Remote) fetchBatch(ctx context.Context, ids []object.ID, fn func(object.ID, []byte) error) error {
+// Authorization returns the header value to send for ctx.
+func (r *Remote) Authorization(ctx context.Context) string {
+	if a := AuthFrom(ctx); a != "" {
+		return a
+	}
+	if r.Token != "" {
+		return "Bearer " + r.Token
+	}
+	return ""
+}
+
+func (r *Remote) fetchBatch(ctx context.Context, ids []object.ID, fn func(object.ID, []byte, bool) error) error {
 	want := ids
 	var lastErr error
 	for attempt := 0; attempt <= r.Retries && len(want) > 0; attempt++ {
 		got := make(map[object.ID]bool, len(want))
-		var missing []object.ID
-		lastErr = r.once(ctx, want, func(id object.ID, b []byte) error {
+		var missing, forbidden []object.ID
+		lastErr = r.once(ctx, want, func(id object.ID, b []byte, state uint32) error {
 			got[id] = true
-			if b == nil {
+			switch state {
+			case missingLen:
 				missing = append(missing, id)
 				return nil
+			case forbiddenLen:
+				forbidden = append(forbidden, id)
+				return nil
 			}
-			return fn(id, b)
+			return fn(id, b, state == privateBit)
 		})
 		if lastErr != nil && ctx.Err() != nil {
 			return lastErr
@@ -316,6 +450,9 @@ func (r *Remote) fetchBatch(ctx context.Context, ids []object.ID, fn func(object
 			}
 		}
 		want = rest
+		if len(forbidden) > 0 {
+			return &ForbiddenError{forbidden}
+		}
 		if len(missing) > 0 {
 			return &MissingError{missing}
 		}
@@ -332,7 +469,9 @@ func (r *Remote) fetchBatch(ctx context.Context, ids []object.ID, fn func(object
 	return fmt.Errorf("fetch %d objects: %w", len(want), lastErr)
 }
 
-func (r *Remote) once(ctx context.Context, ids []object.ID, fn func(object.ID, []byte) error) error {
+// once performs one request. fn's state is 0 for a normal object,
+// privateBit for a private one, or missingLen / forbiddenLen.
+func (r *Remote) once(ctx context.Context, ids []object.ID, fn func(object.ID, []byte, uint32) error) error {
 	body := make([]byte, 0, len(ids)*32)
 	for _, id := range ids {
 		body = append(body, id[:]...)
@@ -340,6 +479,9 @@ func (r *Remote) once(ctx context.Context, ids []object.ID, fn func(object.ID, [
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.base+"/v1/objects", bytes.NewReader(body))
 	if err != nil {
 		return err
+	}
+	if a := r.Authorization(ctx); a != "" {
+		req.Header.Set("Authorization", a)
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -362,20 +504,24 @@ func (r *Remote) once(ctx context.Context, ids []object.ID, fn func(object.ID, [
 		var id object.ID
 		copy(id[:], hdr[:32])
 		n := binary.BigEndian.Uint32(hdr[32:])
-		if n == missingLen {
-			if err := fn(id, nil); err != nil {
+		if n == missingLen || n == forbiddenLen {
+			if err := fn(id, nil, n); err != nil {
 				return err
 			}
 			continue
 		}
-		if n > 1<<31 {
+		state := uint32(0)
+		if n&privateBit != 0 {
+			state, n = privateBit, n&^privateBit
+		}
+		if n > 1<<30 {
 			return fmt.Errorf("object frame too large")
 		}
 		b := make([]byte, n)
 		if _, err := io.ReadFull(br, b); err != nil {
 			return err
 		}
-		if err := fn(id, b); err != nil {
+		if err := fn(id, b, state); err != nil {
 			return err
 		}
 	}

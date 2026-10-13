@@ -40,7 +40,7 @@ func seed(n int) (*store.MemLRU, []object.ID) {
 
 func TestTierCoalescesConcurrentMisses(t *testing.T) {
 	origin, ids := seed(1000)
-	up := &countingSource{inner: StoreSource{origin}}
+	up := &countingSource{inner: StoreSource{Store: origin}}
 	tier := NewTier(store.NewMemLRU(1<<30), up)
 	var wg sync.WaitGroup
 	for j := 0; j < 32; j++ {
@@ -61,7 +61,7 @@ func TestTierCoalescesConcurrentMisses(t *testing.T) {
 
 func TestHTTPTiersAndMissing(t *testing.T) {
 	origin, ids := seed(5000)
-	srv := httptest.NewServer(http.HandlerFunc(Handler(StoreSource{origin})))
+	srv := httptest.NewServer(http.HandlerFunc(Handler(StoreSource{Store: origin})))
 	defer srv.Close()
 	cache := NewTier(store.NewMemLRU(1<<30), NewRemote(srv.URL))
 	csrv := httptest.NewServer(http.HandlerFunc(Handler(cache)))

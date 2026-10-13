@@ -37,6 +37,8 @@ type Config struct {
 	CacheBytes int64 `json:"cache_bytes,omitempty"`
 	// Author identity for new changesets.
 	Author string `json:"author,omitempty"`
+	// Token authenticates to the server and tiers ($GFT_TOKEN overrides).
+	Token string `json:"token,omitempty"`
 }
 
 // Head is persisted in .gft/HEAD.json.
@@ -106,11 +108,17 @@ func Open(root string) (*Worktree, error) {
 	if err := readJSON(meta(root, "HEAD.json"), &w.Head); err != nil {
 		return nil, err
 	}
-	w.API = api.NewClient(w.Config.Server)
+	token := w.Config.Token
+	if t := os.Getenv("GFT_TOKEN"); t != "" {
+		token = t
+	}
+	w.API = api.NewClientToken(w.Config.Server, token)
 	switch {
 	case strings.HasPrefix(w.Config.Objects, "unix://"):
 		// The node daemon holds the shared cache; keep nothing locally.
-		w.src = fetch.NewRemote(w.Config.Objects)
+		r := fetch.NewRemote(w.Config.Objects)
+		r.Token = token
+		w.src = r
 	default:
 		up := w.Config.Objects
 		if up == "" {
@@ -121,7 +129,9 @@ func Open(root string) (*Worktree, error) {
 			return nil, err
 		}
 		w.cache = c
-		w.src = fetch.NewTier(store.KindFilter{Objects: c, Kinds: []object.Kind{object.KindTree}}, fetch.NewRemote(up))
+		r := fetch.NewRemote(up)
+		r.Token = token
+		w.src = fetch.NewTier(store.KindFilter{Objects: c, Kinds: []object.Kind{object.KindTree}}, r)
 	}
 	return w, nil
 }

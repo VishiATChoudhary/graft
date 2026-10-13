@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/VishiATChoudhary/graft/internal/acl"
 	"github.com/VishiATChoudhary/graft/internal/api"
 	"github.com/VishiATChoudhary/graft/internal/fetch"
 	"github.com/VishiATChoudhary/graft/internal/metrics"
@@ -33,6 +34,7 @@ func cmdServe(args []string) error {
 	storeNodes := fs.String("store", "", "server: comma-separated storage nodes (stateless API server); omit to use --data")
 	shard := fs.Int("shard", 0, "store: this node's index in --nodes")
 	nodes := fs.String("nodes", "", "store: comma-separated URLs of every storage node, in shard order")
+	aclFile := fs.String("acl", "", "server: access control policy (JSON); see docs/ACL.md")
 	listen := fs.String("listen", "127.0.0.1:7070", "listen address (host:port, or unix:///path.sock)")
 	data := fs.String("data", "", "server: data directory")
 	upstream := fs.String("upstream", "", "cache/daemon: the single upstream tier (strict tiering)")
@@ -65,7 +67,18 @@ func cmdServe(args []string) error {
 		if err != nil {
 			return err
 		}
-		(&api.Server{Repo: r, Log: log.Default()}).Routes(mux)
+		srv := &api.Server{Repo: r, Log: log.Default()}
+		if *aclFile != "" {
+			pol, err := acl.Load(*aclFile)
+			if err != nil {
+				return err
+			}
+			if err := srv.EnableACL(pol); err != nil {
+				return err
+			}
+			log.Printf("access control enabled from %s", *aclFile)
+		}
+		srv.Routes(mux)
 	case "store":
 		if *data == "" || *nodes == "" {
 			return errors.New("the store tier needs --data and --nodes (and --shard)")

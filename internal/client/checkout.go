@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/VishiATChoudhary/graft/internal/fetch"
 	"github.com/VishiATChoudhary/graft/internal/object"
 	"github.com/VishiATChoudhary/graft/internal/store"
 )
@@ -26,6 +27,8 @@ const (
 type CheckoutStats struct {
 	Trees, Files, Deleted int
 	Bytes                 int64
+	// Restricted lists directories skipped because the caller may not read them.
+	Restricted []object.ID
 }
 
 type blobJob struct {
@@ -75,7 +78,8 @@ func (w *Worktree) Checkout(ctx context.Context, rev string, force bool) (*Check
 	return st, w.SaveHead()
 }
 
-// fetchTrees fetches tree objects and decodes them.
+// fetchTrees fetches tree objects and decodes them. Trees the caller may
+// not read are left out of the result (and reported in forbidden).
 func (w *Worktree) fetchTrees(ctx context.Context, ids []object.ID) (map[object.ID]*object.Tree, error) {
 	out := make(map[object.ID]*object.Tree, len(ids))
 	var mu sync.Mutex
@@ -116,6 +120,11 @@ func (w *Worktree) parallelFetch(ctx context.Context, ids []object.ID, batch int
 			defer wg.Done()
 			for b := range work {
 				if err := w.src.Fetch(ctx, b, fn); err != nil {
+					var fe *fetch.ForbiddenError
+					if errors.As(err, &fe) {
+						// Access-controlled directories are skipped, not fatal.
+						continue
+					}
 					errc <- err
 					cancel()
 					return
@@ -171,7 +180,12 @@ func (w *Worktree) materialize(ctx context.Context, root object.ID, idx Index) (
 		st.Trees += len(ids)
 		var next []dirRef
 		for _, d := range level {
-			for _, e := range trees[d.id].Entries {
+			t := trees[d.id]
+			if t == nil {
+				st.Restricted = append(st.Restricted, d.id)
+				continue
+			}
+			for _, e := range t.Entries {
 				p := path.Join(d.path, e.Name)
 				if e.Mode == object.ModeDir {
 					if w.towardSparse(p) {

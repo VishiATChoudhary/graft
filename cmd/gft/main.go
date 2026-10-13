@@ -221,7 +221,7 @@ func openWT() (*client.Worktree, error) {
 // server if inside one, else --server / $GFT_SERVER.
 func apiClient(server string) (*api.Client, *client.Worktree) {
 	if server != "" {
-		return api.NewClient(server), nil
+		return api.NewClientToken(server, os.Getenv("GFT_TOKEN")), nil
 	}
 	if mc, _ := vfs.FindMount("."); mc != nil {
 		var h vfs.MountHead
@@ -232,7 +232,7 @@ func apiClient(server string) (*api.Client, *client.Worktree) {
 	if wt, err := openWT(); err == nil {
 		return wt.API, wt
 	}
-	return api.NewClient(envOr("GFT_SERVER", "http://127.0.0.1:7070")), nil
+	return api.NewClientToken(envOr("GFT_SERVER", "http://127.0.0.1:7070"), os.Getenv("GFT_TOKEN")), nil
 }
 
 // defaultRev is HEAD's changeset in a working copy, else main.
@@ -315,6 +315,7 @@ func cmdClone(args []string) error {
 	objects := fs.String("objects", "", "object endpoint: daemon socket (unix://...) or cache URL")
 	rev := fs.String("rev", "main", "revision to check out")
 	author := fs.String("author", "", "author identity (default from git config or $USER)")
+	token := fs.String("token", "", "bearer token for an access-controlled server (or $GFT_TOKEN)")
 	pos := parse(fs, args)
 	if len(pos) != 2 {
 		return errors.New("usage: gft clone <server> <dir>")
@@ -323,7 +324,7 @@ func cmdClone(args []string) error {
 		*author = defaultAuthor()
 	}
 	start := time.Now()
-	wt, err := client.Init(pos[1], client.Config{Server: pos[0], Objects: *objects, Sparse: sparse, Author: *author})
+	wt, err := client.Init(pos[1], client.Config{Server: pos[0], Objects: *objects, Sparse: sparse, Author: *author, Token: *token})
 	if err != nil {
 		return err
 	}
@@ -333,6 +334,9 @@ func cmdClone(args []string) error {
 		return err
 	}
 	fmt.Printf("checked out %s: %d files, %.1f MB, %d trees in %s\n", wt.Head.Changeset.Short(), st.Files, float64(st.Bytes)/1e6, st.Trees, time.Since(start).Round(time.Millisecond))
+	if len(st.Restricted) > 0 {
+		fmt.Printf("skipped %d director(ies) you do not have access to\n", len(st.Restricted))
+	}
 	return nil
 }
 

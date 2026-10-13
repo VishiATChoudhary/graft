@@ -5,6 +5,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VishiATChoudhary/graft/internal/acl"
 	"github.com/VishiATChoudhary/graft/internal/diff"
 	"github.com/VishiATChoudhary/graft/internal/fetch"
 	"github.com/VishiATChoudhary/graft/internal/metrics"
@@ -28,6 +30,10 @@ import (
 type Server struct {
 	Repo *repo.Repo
 	Log  *log.Logger
+	// ACL, if set (via EnableACL), enforces repository and directory
+	// permissions.
+	ACL        *acl.Policy
+	restricted restrictedIndex
 }
 
 // ChangesetInfo is the JSON form of a changeset with derived context.
@@ -103,9 +109,10 @@ type ConflictBody struct {
 
 // Routes registers the full API on mux.
 func (s *Server) Routes(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/objects", fetch.Handler(fetch.StoreSource{Store: s.Repo.DB}))
-	mux.HandleFunc("/v1/objects/missing", s.missing)
-	mux.HandleFunc("/v1/objects/put", s.put)
+	objects := fetch.Handler(fetch.StoreSource{Store: s.Repo.DB, Guard: s.objectGuard})
+	mux.HandleFunc("/v1/objects", s.raw(objects, ""))
+	mux.HandleFunc("/v1/objects/missing", s.raw(s.missing, "write"))
+	mux.HandleFunc("/v1/objects/put", s.raw(s.put, "write"))
 	mux.HandleFunc("/v1/info", s.wrap(s.info))
 	mux.HandleFunc("/v1/refs", s.wrap(s.refs))
 	mux.HandleFunc("/v1/refs/update", s.wrap(s.refUpdate))
@@ -115,21 +122,46 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/write", s.wrap(s.write))
 	mux.HandleFunc("/v1/log", s.wrap(s.log))
 	mux.HandleFunc("/v1/blame", s.wrap(s.blame))
-	mux.HandleFunc("/v1/diff", s.diff)
+	mux.HandleFunc("/v1/diff", s.raw(s.diff, "read"))
 	mux.HandleFunc("/v1/mergebase", s.wrap(s.mergebase))
 	mux.HandleFunc("/v1/isancestor", s.wrap(s.isancestor))
 	mux.HandleFunc("/v1/rebase", s.wrap(s.rebase))
 	mux.HandleFunc("/v1/merge", s.wrap(s.merge))
 	mux.HandleFunc("/v1/land", s.wrap(s.land))
 	mux.HandleFunc("/v1/ls", s.wrap(s.ls))
-	mux.HandleFunc("/v1/cat", s.cat)
+	mux.HandleFunc("/v1/cat", s.raw(s.cat, "read"))
 	mux.HandleFunc("/v1/search", s.wrap(s.search))
+}
+
+// raw wraps a non-JSON handler with authentication and a repository-level
+// permission check ("" leaves checks to the handler).
+func (s *Server) raw(h http.HandlerFunc, need string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r = s.authenticate(r)
+		var err error
+		switch need {
+		case "read":
+			err = s.requireRead(r.Context(), "")
+		case "write":
+			err = s.requireWrite(r.Context(), "")
+		}
+		if err != nil {
+			s.writeErr(w, err)
+			return
+		}
+		h(w, r)
+	}
 }
 
 type handler func(r *http.Request) (any, error)
 
 func (s *Server) wrap(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = s.authenticate(r)
+		if err := s.requireRead(r.Context(), ""); err != nil {
+			s.writeErr(w, err)
+			return
+		}
 		v, err := h(r)
 		if err != nil {
 			s.writeErr(w, err)
@@ -156,6 +188,8 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		code = http.StatusBadRequest
 	case errors.Is(err, repo.ErrMissing):
 		code = http.StatusUnprocessableEntity
+	case errors.Is(err, errForbidden):
+		code = http.StatusForbidden
 	}
 	if code == http.StatusInternalServerError && s.Log != nil {
 		s.Log.Printf("error: %v", err)
@@ -221,6 +255,14 @@ func (s *Server) Info(id object.ID, withChanges bool) (*ChangesetInfo, error) {
 	return ci, nil
 }
 
+func (s *Server) changesetInfo(ctx context.Context, id object.ID, withChanges bool) (*ChangesetInfo, error) {
+	ci, err := s.Info(id, withChanges)
+	if err == nil && withChanges {
+		ci.Changes = s.filterChanges(ctx, ci.Changes)
+	}
+	return ci, err
+}
+
 func (s *Server) info(r *http.Request) (any, error) {
 	refs, err := s.Repo.Refs()
 	if err != nil {
@@ -236,6 +278,13 @@ func (s *Server) refs(r *http.Request) (any, error) { return s.Repo.Refs() }
 func (s *Server) refUpdate(r *http.Request) (any, error) {
 	var u RefUpdate
 	if err := decodeJSON(r, &u); err != nil {
+		return nil, err
+	}
+	if u.New.IsZero() {
+		if err := s.requireAdmin(r.Context()); err != nil {
+			return nil, err
+		}
+	} else if err := s.checkRefMove(r.Context())(u.Old, u.New); err != nil {
 		return nil, err
 	}
 	if err := s.Repo.UpdateRef(u.Name, u.Old, u.New); err != nil {
@@ -257,7 +306,7 @@ func (s *Server) changeset(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.Info(id, true)
+	return s.changesetInfo(r.Context(), id, true)
 }
 
 func (s *Server) create(r *http.Request) (any, error) {
@@ -269,6 +318,11 @@ func (s *Server) create(r *http.Request) (any, error) {
 		req.Time = time.Now().Unix()
 	}
 	cs := &object.Changeset{Parents: req.Parents, Author: req.Author, Time: req.Time, TZ: req.TZ, Message: req.Message, Changes: req.Changes}
+	for _, c := range cs.Changes {
+		if err := s.requireWrite(r.Context(), c.Path); err != nil {
+			return nil, err
+		}
+	}
 	id, err := s.Repo.Create(cs)
 	if err != nil {
 		return nil, err
@@ -294,6 +348,9 @@ func (s *Server) write(r *http.Request) (any, error) {
 		cs.Parents = []object.ID{p}
 	}
 	for _, f := range req.Files {
+		if err := s.requireWrite(r.Context(), f.Path); err != nil {
+			return nil, err
+		}
 		if f.Delete {
 			cs.Changes = append(cs.Changes, object.Change{Path: f.Path})
 			continue
@@ -314,7 +371,7 @@ func (s *Server) write(r *http.Request) (any, error) {
 	}
 	resp := &WriteResponse{ID: id}
 	if req.Land != "" {
-		if resp.Land, err = s.Repo.Land(req.Land, id, req.Author, cs.Time, 0); err != nil {
+		if resp.Land, err = s.Repo.Land(req.Land, id, req.Author, cs.Time, 0, s.checkRefMove(r.Context())); err != nil {
 			return nil, err
 		}
 	}
@@ -329,6 +386,9 @@ func (s *Server) log(r *http.Request) (any, error) {
 	limit := intParam(r, "limit", 50)
 	var ids []object.ID
 	if p := r.URL.Query().Get("path"); p != "" {
+		if err := s.requireRead(r.Context(), p); err != nil {
+			return nil, err
+		}
 		ids, err = s.Repo.PathLog(id, p, limit, r.URL.Query().Get("follow") == "1")
 	} else {
 		ids, err = s.Repo.Log(id, limit, r.URL.Query().Get("first_parent") == "1")
@@ -353,6 +413,9 @@ func (s *Server) blame(r *http.Request) (any, error) {
 		return nil, err
 	}
 	path := r.URL.Query().Get("path")
+	if err := s.requireRead(r.Context(), path); err != nil {
+		return nil, err
+	}
 	lines, err := s.Repo.Blame(id, path)
 	if err != nil {
 		return nil, err
@@ -439,6 +502,7 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	changes = s.filterFileChanges(r.Context(), changes)
 	if q.Get("patch") != "1" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"from": from, "to": to, "changes": changes})
@@ -558,7 +622,7 @@ func (s *Server) land(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.Repo.Land(req.Ref, id, req.Author, time.Now().Unix(), 0)
+	return s.Repo.Land(req.Ref, id, req.Author, time.Now().Unix(), 0, s.checkRefMove(r.Context()))
 }
 
 func (s *Server) ls(r *http.Request) (any, error) {
@@ -568,6 +632,9 @@ func (s *Server) ls(r *http.Request) (any, error) {
 	}
 	root, err := s.Repo.RootTree(id)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.requireRead(r.Context(), r.URL.Query().Get("path")); err != nil {
 		return nil, err
 	}
 	return s.Repo.ListTree(root, r.URL.Query().Get("path"))
@@ -586,7 +653,17 @@ func (s *Server) search(r *http.Request) (any, error) {
 	if q == "" {
 		return nil, badf("missing q")
 	}
-	return s.Repo.FindPaths(root, r.URL.Query().Get("path"), q, intParam(r, "limit", 100))
+	paths, err := s.Repo.FindPaths(root, r.URL.Query().Get("path"), q, intParam(r, "limit", 100))
+	if err != nil || s.ACL == nil {
+		return paths, err
+	}
+	out := paths[:0:0]
+	for _, p := range paths {
+		if s.canRead(r.Context(), p) {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) cat(w http.ResponseWriter, r *http.Request) {
@@ -597,6 +674,10 @@ func (s *Server) cat(w http.ResponseWriter, r *http.Request) {
 	}
 	root, err := s.Repo.RootTree(id)
 	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if err := s.requireRead(r.Context(), r.URL.Query().Get("path")); err != nil {
 		s.writeErr(w, err)
 		return
 	}

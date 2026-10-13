@@ -22,6 +22,11 @@ type Repo struct {
 	DB  store.Backend
 	eng *derive.Engine
 
+	// OnCreate, if set, is called after a changeset is appended and its
+	// eager derived data is computed (used to index access-controlled
+	// subtrees).
+	OnCreate func(id object.ID)
+
 	cs    *derive.Type // changeset -> root tree, history root, commit graph (one record)
 	blame *derive.Type // file version -> blame runs (lazy)
 	nodes nodeCache
@@ -113,6 +118,9 @@ func (r *Repo) append(cs *object.Changeset) (object.ID, error) {
 		if _, err := r.eng.Get(t, id); err != nil {
 			return object.Zero, err
 		}
+	}
+	if r.OnCreate != nil {
+		r.OnCreate(id)
 	}
 	return id, nil
 }
