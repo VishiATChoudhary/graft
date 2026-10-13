@@ -128,7 +128,7 @@ func (f *fuseFS) Truncate(name string, size uint64, _ *fuse.Context) fuse.Status
 	return errno(bf.Truncate(int64(size)))
 }
 func (f *fuseFS) Access(string, uint32, *fuse.Context) fuse.Status { return fuse.OK }
-func (f *fuseFS) String() string                                     { return "graft" }
+func (f *fuseFS) String() string                                   { return "graft" }
 
 type fuseFile struct {
 	nodefs.File
