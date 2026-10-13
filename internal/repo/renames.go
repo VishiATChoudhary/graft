@@ -45,10 +45,10 @@ func (r *Repo) recordRenames(parent, _ object.ID, seq uint64, changes []object.C
 		if err != nil {
 			continue
 		}
-		// Storage hint: a renamed file is a good delta base for its new
-		// content (most new files have no previous version to delta from).
+		// Storage hint: the renamed file's old content is stored as a
+		// delta against its new content.
 		if e, err := r.Lookup(root, op); err == nil && e.ID != byPath[np] {
-			_ = r.DB.Deltify(byPath[np], e.ID)
+			r.reverseDeltify(e.ID, byPath[np], e.Size)
 		}
 		if err := r.DB.PutDerived("copy", versionKey(np, seq), encodeVersion(op, v.link)); err != nil {
 			return err

@@ -143,6 +143,22 @@ func (r *Repo) computeRoot(id object.ID, parents []object.ID, vals [][]byte) ([]
 	if err != nil {
 		return nil, err
 	}
+	// Merges: the other parents' versions of merged paths would otherwise
+	// never get a newer version to be stored as deltas against.
+	for _, p := range parents[min(1, len(parents)):] {
+		proot, err := r.RootTree(p)
+		if err != nil {
+			return nil, err
+		}
+		for _, ch := range cs.Changes {
+			if ch.Mode != object.ModeFile && ch.Mode != object.ModeExec {
+				continue
+			}
+			if e := r.fileAt(proot, ch.Path); (e.Mode == object.ModeFile || e.Mode == object.ModeExec) && e.ID != ch.Blob {
+				r.reverseDeltify(e.ID, ch.Blob, e.Size)
+			}
+		}
+	}
 	return t[:], nil
 }
 

@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"encoding/binary"
 	"fmt"
 	"path"
 	"sort"
@@ -79,6 +80,17 @@ func (r *Repo) applyTree(base object.ID, changes []object.Change) (object.ID, er
 		cur, exists := entries[g.name]
 		if g.direct != nil && len(g.nested) == 0 {
 			if g.direct.Mode == object.ModeNone {
+				if exists && (cur.Mode == object.ModeFile || cur.Mode == object.ModeExec) {
+					// The deleted file's last version has no newer version
+					// to delta against; offer similar surviving siblings.
+					delete(entries, g.name)
+					sib := make([]object.TreeEntry, 0, len(entries))
+					for _, e := range entries {
+						sib = append(sib, e)
+					}
+					r.deltifyNewFile(g.name, cur.ID, cur.Size, sib)
+					continue
+				}
 				delete(entries, g.name)
 			} else {
 				size, err := r.blobSize(g.direct.Blob)
@@ -86,9 +98,10 @@ func (r *Repo) applyTree(base object.ID, changes []object.Change) (object.ID, er
 					return object.Zero, err
 				}
 				if exists && cur.Mode != object.ModeDir && cur.ID != g.direct.Blob && g.direct.Mode != object.ModeGitlink {
-					// Storage hint: keep the new version as a delta
-					// against the previous version of this path.
-					_ = r.DB.Deltify(g.direct.Blob, cur.ID)
+					// Storage hint, like git: the newest version stays
+					// whole and the previous one becomes a reverse delta
+					// against it (code mostly grows, so these are small).
+					r.reverseDeltify(cur.ID, g.direct.Blob, cur.Size)
 				} else if !exists && g.direct.Mode == object.ModeFile {
 					sib := make([]object.TreeEntry, 0, len(entries))
 					for _, e := range entries {
@@ -154,6 +167,21 @@ func (r *Repo) deltifyNewFile(name string, blob object.ID, size uint64, siblings
 		_ = r.DB.Deltify(blob, cs[i].id)
 	}
 }
+
+// reverseDeltify stores old as a delta against new (like git, the newest
+// version stays whole). Chains to ancient versions grow as history does, so
+// some versions are kept whole as keyframes, chosen pseudo-randomly by ID
+// with probability size/keyframeBudget: the expected bytes rebuilt to read
+// any version stay around keyframeBudget, and small files (cheap to
+// rebuild) almost never pay for a keyframe.
+func (r *Repo) reverseDeltify(old, new object.ID, size uint64) {
+	if size > 0 && binary.BigEndian.Uint32(old[1:5])%uint32(max(2, keyframeBudget/size)) == 0 {
+		return
+	}
+	_ = r.DB.Deltify(old, new)
+}
+
+const keyframeBudget = 64 << 20
 
 func (r *Repo) blobSize(id object.ID) (uint64, error) {
 	n, err := r.DB.PayloadSize(id)

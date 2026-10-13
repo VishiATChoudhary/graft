@@ -52,6 +52,7 @@ type DB struct {
 
 	deltas, dicted atomic.Uint64
 	peers          BaseResolver
+	why            [8]atomic.Uint64 // Deltify outcomes, for diagnostics
 }
 
 const (
@@ -71,6 +72,8 @@ const (
 	// are larger, so theirs are shorter (git's default pack depth is 50).
 	maxDeltaDepth     = 128
 	maxBlobDeltaDepth = 64
+
+	maxChainRead      = 1 << 14
 
 	dictSamples = 2000
 
@@ -305,7 +308,10 @@ func (d *DB) Payload(id object.ID) (object.Kind, []byte, error) {
 			d.cachePayload(cur, kind, base)
 			break
 		}
-		if len(chain) > maxDeltaDepth+1 {
+		// Reverse deltas grow chains after the fact (an old version's base
+		// may later become a delta itself), so the cap here is a safety
+		// net against corruption, not the write-time depth limit.
+		if len(chain) > maxChainRead {
 			return 0, nil, fmt.Errorf("%w: delta chain too long at %s", object.ErrCorrupt, id.Short())
 		}
 		chain = append(chain, r)
@@ -483,7 +489,14 @@ func (d *DB) Deltify(id, base object.ID) error {
 	if err != nil {
 		return err
 	}
-	if r := d.deltaRecord(id, k, p, base, true); r != nil && len(r) < len(b) {
+	r := d.deltaRecord(id, k, p, base, true)
+	switch {
+	case r == nil:
+		d.why[1].Add(1)
+	case len(r) >= len(b):
+		d.why[2].Add(1)
+	default:
+		d.why[0].Add(1)
 		d.deltas.Add(1)
 		return d.write(id, r)
 	}
@@ -510,12 +523,18 @@ func (d *DB) deltaRecord(id object.ID, k object.Kind, p []byte, base object.ID, 
 	} else {
 		return nil
 	}
-	if err != nil || info.Kind != k || info.Depth+1 > limit {
+	if err != nil || info.Kind != k {
+		d.why[3].Add(1)
+		return nil
+	}
+	if info.Depth+1 > limit {
+		d.why[4].Add(1)
 		return nil
 	}
 	if existing {
 		for _, c := range info.Chain {
 			if c == [keyIDLen]byte(id[:keyIDLen]) {
+				d.why[5].Add(1)
 				return nil
 			}
 		}
@@ -826,6 +845,7 @@ func (d *DB) Stats() map[string]any {
 		"delta_objects": d.deltas.Load(),
 		"dict_objects":  d.dicted.Load(),
 		"disk_bytes":    d.db.Metrics().DiskSpaceUsage(),
+		"deltify":       fmt.Sprintf("ok=%d nil=%d notsmaller=%d base=%d depth=%d cycle=%d", d.why[0].Load(), d.why[1].Load(), d.why[2].Load(), d.why[3].Load(), d.why[4].Load(), d.why[5].Load()),
 	}
 }
 
@@ -891,7 +911,7 @@ func (d *DB) localBase(id object.ID, withChain bool) (*BaseInfo, error) {
 	}
 	if r.codec == codecDelta && withChain {
 		cur := r
-		for n := 0; cur.codec == codecDelta && n <= maxDeltaDepth; n++ {
+		for n := 0; cur.codec == codecDelta && n <= maxChainRead; n++ {
 			var c [keyIDLen]byte
 			copy(c[:], cur.base[:keyIDLen])
 			info.Chain = append(info.Chain, c)
