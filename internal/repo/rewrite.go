@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
+	"time"
 
 	"github.com/VishiATChoudhary/graft/internal/diff"
 	"github.com/VishiATChoudhary/graft/internal/object"
@@ -227,12 +229,21 @@ type LandResult struct {
 // compare-and-swap. There is no global lock or merge queue: concurrent
 // lands race on the CAS of a single ref and the loser simply retries.
 // check, if set, may veto moving the ref from old to new (authorization).
+//
+// Under contention, losers back off for a random, exponentially growing
+// interval before retrying, so racing lands spread out instead of colliding
+// in lockstep. maxAttempts <= 0 means no attempt limit within landTimeout.
 func (r *Repo) Land(ref string, head object.ID, author string, when int64, maxAttempts int, check ...func(old, new object.ID) error) (*LandResult, error) {
-	if maxAttempts <= 0 {
-		maxAttempts = 64
-	}
 	res := &LandResult{}
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	deadline := time.Now().Add(landTimeout)
+	for attempt := 1; maxAttempts <= 0 || attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			if time.Now().After(deadline) {
+				break
+			}
+			backoff := time.Duration(1<<min(attempt-2, 6)) * time.Millisecond
+			time.Sleep(time.Duration(rand.Int64N(int64(backoff) + 1)))
+		}
 		res.Attempts = attempt
 		tip, err := r.DB.GetRef(ref)
 		if err == object.ErrNotFound {
@@ -285,5 +296,8 @@ func (r *Repo) Land(ref string, head object.ID, author string, when int64, maxAt
 		res.New = target
 		return res, nil
 	}
-	return nil, fmt.Errorf("%w: gave up after %d attempts", ErrStaleRef, maxAttempts)
+	return nil, fmt.Errorf("%w: gave up after %d attempts", ErrStaleRef, res.Attempts)
 }
+
+// landTimeout bounds how long a land keeps retrying under contention.
+const landTimeout = 2 * time.Minute
