@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/VishiATChoudhary/graft/internal/derive"
 	"github.com/VishiATChoudhary/graft/internal/object"
@@ -28,6 +30,10 @@ type Repo struct {
 	OnCreate func(id object.ID)
 
 	cs    *derive.Type // changeset -> root tree, history root, commit graph (one record)
+
+	unodes   *store.MemLRU // decoded directory versions
+	batches  sync.Map      // link -> map[path]storedEntry
+	nbatches atomic.Int64
 	blame *derive.Type // file version -> blame runs (lazy)
 	nodes nodeCache
 }
@@ -42,7 +48,7 @@ var (
 
 // Open opens a repository over an existing DB.
 func Open(db store.Backend) (*Repo, error) {
-	r := &Repo{DB: db, eng: derive.NewEngine(db)}
+	r := &Repo{DB: db, eng: derive.NewEngine(db), unodes: store.NewMemLRU(64 << 20)}
 	csParents := func(id object.ID) ([]object.ID, error) {
 		cs, err := r.Changeset(id)
 		if err != nil {

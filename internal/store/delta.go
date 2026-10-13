@@ -111,3 +111,8 @@ func applyDelta(base, delta []byte, n uint64) ([]byte, error) {
 	}
 	return out, nil
 }
+
+// MakeDelta and ApplyDelta expose the delta codec for derived-data storage.
+func MakeDelta(base, target []byte) []byte { return makeDelta(base, target) }
+
+func ApplyDelta(base, delta []byte, n uint64) ([]byte, error) { return applyDelta(base, delta, n) }

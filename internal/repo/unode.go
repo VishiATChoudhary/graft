@@ -92,21 +92,157 @@ func decodeUnode(b []byte) (*Unode, error) {
 	return u, d.Err
 }
 
-func (r *Repo) readUnode(id object.ID) (*Unode, error) {
-	p, err := store.ReadPayload(r.DB, id, object.KindUnode)
+// Storage. All directory versions written by one changeset are stored as a
+// single derived record keyed by the changeset's log sequence ("ub"). A
+// version is stored whole or as a delta against the previous version of the
+// same directory, which is referenced by that version's sequence number, so
+// a typical version costs a few dozen bytes and no key of its own. Chains
+// are capped at unodeKeyframe deltas.
+
+const unodeKeyframe = 64
+
+type batchEntry struct {
+	u    *Unode
+	prev uint64 // link of the previous version of this directory (0: none)
+}
+
+// unodeBatch collects the directory versions written by one changeset.
+type unodeBatch struct {
+	link    uint64
+	entries map[string]*batchEntry
+}
+
+func newBatch(link uint64) *unodeBatch {
+	return &unodeBatch{link: link, entries: map[string]*batchEntry{}}
+}
+
+func (b *unodeBatch) put(path string, u *Unode, prev uint64) {
+	b.entries[path] = &batchEntry{u, prev}
+}
+
+func batchKey(link uint64) object.ID { return versionKey("\x00unodes", link) }
+
+type storedEntry struct {
+	prev, size uint64
+	depth      int
+	delta      bool
+	data       []byte
+}
+
+func (r *Repo) writeBatch(b *unodeBatch) error {
+	if len(b.entries) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(b.entries))
+	for p := range b.entries {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	var e object.Encoder
+	e.Uvarint(uint64(len(paths)))
+	for _, p := range paths {
+		be := b.entries[p]
+		payload := be.u.encode()
+		e.String(p)
+		e.Uvarint(be.prev)
+		e.Uvarint(uint64(len(payload)))
+		if be.prev != 0 {
+			if base, depth, err := r.unodePayload(p, be.prev); err == nil && depth+1 < unodeKeyframe {
+				if d := store.MakeDelta(base, payload); d != nil && len(d) < len(payload) {
+					e.Uvarint(uint64(depth + 1))
+					e.Byte(1)
+					e.Bytes(d)
+					r.cacheUnode(p, b.link, payload, depth+1)
+					continue
+				}
+			}
+		}
+		e.Uvarint(0)
+		e.Byte(0)
+		e.Bytes(payload)
+		r.cacheUnode(p, b.link, payload, 0)
+	}
+	return r.DB.PutDerived("ub", batchKey(b.link), object.Pack(object.KindUnode, e.B))
+}
+
+func (r *Repo) loadBatch(link uint64) (map[string]storedEntry, error) {
+	if v, ok := r.batches.Load(link); ok {
+		return v.(map[string]storedEntry), nil
+	}
+	raw, err := r.DB.GetDerived("ub", batchKey(link))
+	if err != nil {
+		return nil, err
+	}
+	_, b, err := object.Unpack(raw)
+	if err != nil {
+		return nil, err
+	}
+	d := object.Decoder{B: b}
+	n := d.Uvarint()
+	if n > uint64(len(b)) {
+		return nil, object.ErrCorrupt
+	}
+	out := make(map[string]storedEntry, n)
+	for i := uint64(0); i < n && d.Err == nil; i++ {
+		p := d.String()
+		se := storedEntry{prev: d.Uvarint(), size: d.Uvarint()}
+		se.depth = int(d.Uvarint())
+		se.delta = d.Byte() == 1
+		se.data = d.Bytes()
+		out[p] = se
+	}
+	if d.Err != nil {
+		return nil, d.Err
+	}
+	if r.nbatches.Add(1) > 1<<14 {
+		r.batches.Range(func(k, _ any) bool { r.batches.Delete(k); return true })
+		r.nbatches.Store(0)
+	}
+	r.batches.Store(link, out)
+	return out, nil
+}
+
+func (r *Repo) cacheUnode(path string, link uint64, payload []byte, depth int) {
+	v := make([]byte, 1+len(payload))
+	v[0] = byte(depth)
+	copy(v[1:], payload)
+	r.unodes.Put(versionKey(path, link), v)
+}
+
+// unodePayload returns the encoded unode for directory path at link, and
+// its delta depth.
+func (r *Repo) unodePayload(path string, link uint64) ([]byte, int, error) {
+	if v, err := r.unodes.Get(versionKey(path, link)); err == nil {
+		return v[1:], int(v[0]), nil
+	}
+	b, err := r.loadBatch(link)
+	if err != nil {
+		return nil, 0, err
+	}
+	se, ok := b[path]
+	if !ok {
+		return nil, 0, fmt.Errorf("%w: unode %q@%d", object.ErrNotFound, path, link)
+	}
+	payload := se.data
+	if se.delta {
+		base, _, err := r.unodePayload(path, se.prev)
+		if err != nil {
+			return nil, 0, err
+		}
+		if payload, err = store.ApplyDelta(base, se.data, se.size); err != nil {
+			return nil, 0, err
+		}
+	}
+	r.cacheUnode(path, link, payload, se.depth)
+	return payload, se.depth, nil
+}
+
+func (r *Repo) readUnode(path string, link uint64) (*Unode, error) {
+	p, _, err := r.unodePayload(path, link)
 	if err != nil {
 		return nil, err
 	}
 	return decodeUnode(p)
-}
-
-// writeUnode stores the unode for directory path at versionKey(path,
-// u.Link); base (the previous version of the directory) lets the store keep
-// it as a small delta. Unodes are server-internal, so they are keyed by
-// version rather than by content hash.
-func (r *Repo) writeUnode(path string, u *Unode, base object.ID) (object.ID, error) {
-	id := versionKey(path, u.Link)
-	return id, r.DB.PutBase(id, object.Pack(object.KindUnode, u.encode()), base)
 }
 
 func (u *Unode) find(name string) int {
@@ -117,42 +253,46 @@ func (u *Unode) find(name string) int {
 	return -1
 }
 
-// tombstoneDir marks every live entry beneath a directory unode deleted.
-func (r *Repo) tombstoneDir(path string, id object.ID, link uint64) (object.ID, error) {
-	u, err := r.readUnode(id)
+// tombstoneDir writes a version of directory path at link in which every
+// live entry beneath it is deleted. cur is the directory's current link.
+func (r *Repo) tombstoneDir(path string, cur, link uint64, b *unodeBatch) error {
+	u, err := r.readUnode(path, cur)
 	if err != nil {
-		return object.Zero, err
+		return err
 	}
 	if u.Deleted {
-		return id, nil
+		return nil
 	}
 	nu := &Unode{Deleted: true, Link: link, Entries: make([]UnodeEntry, len(u.Entries))}
 	for i, e := range u.Entries {
 		if !e.Deleted {
 			if e.Dir {
-				cp := join(path, e.Name)
-				if _, err := r.tombstoneDir(cp, versionKey(cp, e.Link), link); err != nil {
-					return object.Zero, err
+				if err := r.tombstoneDir(join(path, e.Name), e.Link, link, b); err != nil {
+					return err
 				}
 			}
 			e.Deleted, e.Link = true, link
 		}
 		nu.Entries[i] = e
 	}
-	return r.writeUnode(path, nu, id)
+	b.put(path, nu, cur)
+	return nil
 }
 
-func (r *Repo) applyUnode(dir string, p1 object.ID, changes []object.Change, link uint64) (object.ID, error) {
+// applyUnode writes the new version of directory dir (previous version at
+// prev, 0 if none) with changes applied. It reports whether the directory
+// still exists (possibly as a tombstone) and whether it is deleted.
+func (r *Repo) applyUnode(dir string, prev uint64, changes []object.Change, link uint64, b *unodeBatch) (bool, bool, error) {
 	base := &Unode{}
-	if !p1.IsZero() {
+	if prev != 0 {
 		var err error
-		if base, err = r.readUnode(p1); err != nil {
-			return object.Zero, err
+		if base, err = r.readUnode(dir, prev); err != nil {
+			return false, false, err
 		}
 	}
 	groups, err := groupChanges(changes)
 	if err != nil {
-		return object.Zero, err
+		return false, false, err
 	}
 	entries := make(map[string]UnodeEntry, len(base.Entries)+len(groups))
 	for _, e := range base.Entries {
@@ -164,8 +304,8 @@ func (r *Repo) applyUnode(dir string, p1 object.ID, changes []object.Change, lin
 		if g.direct != nil && g.direct.Mode == object.ModeNone {
 			if exists && !cur.Deleted {
 				if cur.Dir {
-					if _, err := r.tombstoneDir(cp, versionKey(cp, cur.Link), link); err != nil {
-						return object.Zero, err
+					if err := r.tombstoneDir(cp, cur.Link, link, b); err != nil {
+						return false, false, err
 					}
 				}
 				cur.Deleted, cur.Link = true, link
@@ -179,26 +319,22 @@ func (r *Repo) applyUnode(dir string, p1 object.ID, changes []object.Change, lin
 			entries[g.name] = UnodeEntry{Name: g.name, Link: link}
 			continue
 		}
-		var sub object.ID
+		var sub uint64
 		if exists && cur.Dir {
-			sub = versionKey(cp, cur.Link)
+			sub = cur.Link
 		}
-		child, err := r.applyUnode(cp, sub, g.nested, link)
+		present, deleted, err := r.applyUnode(cp, sub, g.nested, link, b)
 		if err != nil {
-			return object.Zero, err
+			return false, false, err
 		}
-		if child.IsZero() {
+		if !present {
 			delete(entries, g.name)
 			continue
 		}
-		cu, err := r.readUnode(child)
-		if err != nil {
-			return object.Zero, err
-		}
-		entries[g.name] = UnodeEntry{Name: g.name, Dir: true, Deleted: cu.Deleted, Link: link}
+		entries[g.name] = UnodeEntry{Name: g.name, Dir: true, Deleted: deleted, Link: link}
 	}
 	if len(entries) == 0 {
-		return object.Zero, nil
+		return false, false, nil
 	}
 	nu := &Unode{Deleted: true, Link: link}
 	for _, e := range entries {
@@ -208,16 +344,8 @@ func (r *Repo) applyUnode(dir string, p1 object.ID, changes []object.Change, lin
 		}
 	}
 	sort.Slice(nu.Entries, func(i, j int) bool { return nu.Entries[i].Name < nu.Entries[j].Name })
-	return r.writeUnode(dir, nu, p1)
-}
-
-// RootUnode returns the root history unode of a changeset.
-func (r *Repo) RootUnode(id object.ID) (object.ID, error) {
-	c, err := r.csInfo(id)
-	if err != nil || c.Link == 0 {
-		return object.Zero, err
-	}
-	return versionKey("", c.Link), nil
+	b.put(dir, nu, prev)
+	return true, nu.Deleted, nil
 }
 
 // pathVersion identifies one version of a path.
@@ -233,14 +361,14 @@ type pathVersion struct {
 func (r *Repo) lookupVersion(cs object.ID, path string, live bool) (pathVersion, error) {
 	path = strings.Trim(path, "/")
 	notFound := fmt.Errorf("%w: path %q", object.ErrNotFound, path)
-	cur, err := r.RootUnode(cs)
+	c, err := r.csInfo(cs)
 	if err != nil {
 		return pathVersion{}, err
 	}
-	if cur.IsZero() {
+	if c.Link == 0 {
 		return pathVersion{}, notFound
 	}
-	u, err := r.readUnode(cur)
+	u, err := r.readUnode("", c.Link)
 	if err != nil {
 		return pathVersion{}, err
 	}
@@ -263,7 +391,7 @@ func (r *Repo) lookupVersion(cs object.ID, path string, live bool) (pathVersion,
 		if !e.Dir {
 			return pathVersion{}, notFound
 		}
-		if u, err = r.readUnode(versionKey(strings.Join(segs[:i+1], "/"), e.Link)); err != nil {
+		if u, err = r.readUnode(strings.Join(segs[:i+1], "/"), e.Link); err != nil {
 			return pathVersion{}, err
 		}
 	}

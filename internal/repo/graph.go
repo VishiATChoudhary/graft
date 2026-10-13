@@ -151,12 +151,10 @@ func (r *Repo) computeCS(id object.ID, parents []object.ID, vals [][]byte) ([]by
 		}
 	}
 	// History unodes.
-	var p1Unode object.ID
+	var p1Link uint64
 	if p1 != nil {
 		c.Link = p1.Link
-		if p1.Link != 0 {
-			p1Unode = versionKey("", p1.Link)
-		}
+		p1Link = p1.Link
 	}
 	if len(cs.Changes) > 0 {
 		if len(parents) > 0 {
@@ -164,12 +162,16 @@ func (r *Repo) computeCS(id object.ID, parents []object.ID, vals [][]byte) ([]by
 				return nil, err
 			}
 		}
-		u, err := r.applyUnode("", p1Unode, cs.Changes, seq)
+		b := newBatch(seq)
+		present, _, err := r.applyUnode("", p1Link, cs.Changes, seq, b)
 		if err != nil {
 			return nil, err
 		}
+		if err := r.writeBatch(b); err != nil {
+			return nil, err
+		}
 		c.Link = 0
-		if !u.IsZero() {
+		if present {
 			c.Link = seq
 		}
 	}
