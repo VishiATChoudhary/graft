@@ -1,6 +1,6 @@
 module github.com/VishiATChoudhary/graft
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
@@ -8,7 +8,7 @@ require (
 	github.com/go-git/go-billy/v5 v5.9.2
 	github.com/klauspost/compress v1.20.3
 	github.com/willscott/go-nfs v0.0.4
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -25,6 +25,7 @@ require (
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/hanwen/go-fuse/v2 v2.12.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
@@ -38,6 +39,7 @@ require (
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/text v0.39.0 // indirect
+	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 )

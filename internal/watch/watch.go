@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -198,7 +199,11 @@ func SocketPath(root string) string {
 		return p
 	}
 	h := sha256.Sum256([]byte(root))
-	return filepath.Join("/tmp", fmt.Sprintf("gft-%d-%s.sock", os.Getuid(), hex.EncodeToString(h[:6])))
+	dir := "/tmp"
+	if runtime.GOOS == "windows" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, fmt.Sprintf("gft-%d-%s.sock", os.Getuid(), hex.EncodeToString(h[:6])))
 }
 
 // Run watches root until ctx is done, serving queries on its socket.

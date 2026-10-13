@@ -10,13 +10,13 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -40,6 +40,7 @@ func cmdMount(args []string) error {
 	noMount := fs.Bool("no-mount", false, "only serve NFS and print the mount command")
 	rdonly := fs.Bool("rdonly", false, "read-only view (no overlay; commit/land unavailable)")
 	state := fs.String("state", "", "state directory for the writable overlay (default ~/.cache/gft/mounts/<hash>)")
+	backend := fs.String("backend", "", "nfs (macOS default), fuse (Linux default; no root), webdav (Windows default)")
 	pos := parse(fs, args)
 	if len(pos) != 2 {
 		return errors.New("usage: gft mount <server> <mountpoint> [--rev R]")
@@ -112,55 +113,100 @@ func cmdMount(args []string) error {
 		}()
 		served = ov
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	handler := nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(served), 1<<20)
-	go func() {
-		if err := nfs.Serve(ln, handler); err != nil {
-			log.Printf("nfs: %v", err)
-		}
-	}()
-	opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,tcp", port, port)
-	if *rdonly {
-		opts += ",rdonly"
-	}
-	var mountCmd []string
-	if runtime.GOOS == "darwin" {
-		// The served revision can change under the kernel (checkout, land),
-		// so attribute and negative-lookup caching are off (loopback).
-		mountCmd = []string{"mount", "-t", "nfs", "-o", opts + ",nolocks,noresvport,locallocks,noac,nonegnamecache", "localhost:/", mnt}
-	} else {
-		mountCmd = []string{"mount", "-t", "nfs", "-o", opts + ",nolock,noac,lookupcache=none", "localhost:/", mnt}
-	}
 	mode := "writable"
 	if *rdonly {
 		mode = "read-only"
 	}
-	fmt.Printf("serving %s (%s) %s over NFS on 127.0.0.1:%d\n", *rev, ci.ID.Short(), mode, port)
-	mounted := false
-	if *noMount {
-		fmt.Printf("mount with: %s\n", strings.Join(mountCmd, " "))
-	} else {
+	be := *backend
+	if be == "" {
+		switch runtime.GOOS {
+		case "linux":
+			be = "fuse"
+		case "windows":
+			be = "webdav"
+		default:
+			be = "nfs"
+		}
+	}
+	var unmount func() error
+	switch be {
+	case "fuse":
 		if err := os.MkdirAll(mnt, 0o755); err != nil {
 			return err
 		}
-		out, err := exec.Command(mountCmd[0], mountCmd[1:]...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s: %v: %s (on Linux this needs root; try --no-mount and sudo)", strings.Join(mountCmd, " "), err, strings.TrimSpace(string(out)))
+		if unmount, err = vfs.MountFUSE(served, mnt); err != nil {
+			return fmt.Errorf("fuse mount: %w", err)
 		}
-		mounted = true
-		fmt.Printf("mounted at %s; Ctrl-C to unmount\n", mnt)
+		fmt.Printf("serving %s (%s) %s over FUSE\nmounted at %s; Ctrl-C to unmount\n", *rev, ci.ID.Short(), mode, mnt)
+	case "webdav", "nfs":
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return err
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		var mountCmd, umountCmd []string
+		if be == "webdav" {
+			go http.Serve(ln, vfs.WebDAVHandler(served))
+			url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+			if runtime.GOOS == "windows" {
+				mountCmd = []string{"net", "use", mnt, url}
+				umountCmd = []string{"net", "use", mnt, "/delete", "/y"}
+			} else if runtime.GOOS == "darwin" {
+				mountCmd = []string{"mount_webdav", url, mnt}
+				umountCmd = []string{"umount", mnt}
+			}
+			fmt.Printf("serving %s (%s) %s over WebDAV at %s\n", *rev, ci.ID.Short(), mode, url)
+		} else {
+			handler := nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(served), 1<<20)
+			go func() {
+				if err := nfs.Serve(ln, handler); err != nil {
+					log.Printf("nfs: %v", err)
+				}
+			}()
+			opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,tcp", port, port)
+			if *rdonly {
+				opts += ",rdonly"
+			}
+			if runtime.GOOS == "darwin" {
+				// The served revision can change under the kernel (checkout,
+				// land), so attribute and negative-lookup caching are off.
+				mountCmd = []string{"mount", "-t", "nfs", "-o", opts + ",nolocks,noresvport,locallocks,noac,nonegnamecache", "localhost:/", mnt}
+			} else {
+				mountCmd = []string{"mount", "-t", "nfs", "-o", opts + ",nolock,noac,lookupcache=none", "localhost:/", mnt}
+			}
+			umountCmd = []string{"umount", mnt}
+			fmt.Printf("serving %s (%s) %s over NFS on 127.0.0.1:%d\n", *rev, ci.ID.Short(), mode, port)
+		}
+		switch {
+		case *noMount || mountCmd == nil:
+			fmt.Printf("mount with: %s\n", strings.Join(mountCmd, " "))
+		default:
+			if runtime.GOOS != "windows" {
+				if err := os.MkdirAll(mnt, 0o755); err != nil {
+					return err
+				}
+			}
+			out, err := exec.Command(mountCmd[0], mountCmd[1:]...).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%s: %v: %s", strings.Join(mountCmd, " "), err, strings.TrimSpace(string(out)))
+			}
+			unmount = func() error {
+				if err := exec.Command(umountCmd[0], umountCmd[1:]...).Run(); err != nil && runtime.GOOS != "windows" {
+					return exec.Command("umount", "-f", mnt).Run()
+				}
+				return nil
+			}
+			fmt.Printf("mounted at %s; Ctrl-C to unmount\n", mnt)
+		}
+	default:
+		return fmt.Errorf("unknown backend %q (nfs, fuse, webdav)", be)
 	}
 	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(stop, stopSignals...)
 	<-stop
-	if mounted {
-		if out, err := exec.Command("umount", mnt).CombinedOutput(); err != nil {
-			exec.Command("umount", "-f", mnt).Run()
-			_ = out
+	if unmount != nil {
+		if err := unmount(); err != nil {
+			log.Printf("unmount: %v", err)
 		}
 	}
 	t, b, n := vf.Stats()

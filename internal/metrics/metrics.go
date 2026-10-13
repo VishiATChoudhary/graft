@@ -1,4 +1,6 @@
 // Package metrics exposes process resource usage for tier /v1/info.
+//go:build unix
+
 package metrics
 
 import "syscall"

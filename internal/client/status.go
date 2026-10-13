@@ -133,10 +133,16 @@ func modeOf(info fs.FileInfo) object.Mode {
 	switch {
 	case info.Mode()&fs.ModeSymlink != 0:
 		return object.ModeSymlink
-	case info.Mode()&0o111 != 0:
+	case runtime.GOOS != "windows" && info.Mode()&0o111 != 0:
 		return object.ModeExec
 	}
 	return object.ModeFile
+}
+
+// sameMode compares a file's mode with the index's. Windows has no
+// executable bit, so there an exec file matches a regular one.
+func sameMode(indexed, actual object.Mode) bool {
+	return indexed == actual || runtime.GOOS == "windows" && indexed == object.ModeExec && actual == object.ModeFile
 }
 
 // readContent returns file content (the target for symlinks).
@@ -186,7 +192,7 @@ func (w *Worktree) Status(ctx context.Context) ([]FileStatus, error) {
 				e := idx[f.path]
 				state := byte('A')
 				if e != nil {
-					if e.Blob == id && e.Mode == mode {
+					if e.Blob == id && sameMode(e.Mode, mode) {
 						// Content unchanged; refresh stat info lazily.
 						continue
 					}
@@ -200,7 +206,7 @@ func (w *Worktree) Status(ctx context.Context) ([]FileStatus, error) {
 	}
 	for _, f := range files {
 		present[f.path] = true
-		if e := idx[f.path]; e != nil && e.Size == f.info.Size() && e.Mtime == f.info.ModTime().UnixNano() && e.Mode == modeOf(f.info) {
+		if e := idx[f.path]; e != nil && e.Size == f.info.Size() && e.Mtime == f.info.ModTime().UnixNano() && sameMode(e.Mode, modeOf(f.info)) {
 			continue
 		}
 		work <- f
@@ -305,7 +311,7 @@ func (w *Worktree) watchedStatus(idx Index) ([]FileStatus, bool) {
 			continue
 		}
 		mode := modeOf(info)
-		if e != nil && e.Size == info.Size() && e.Mtime == info.ModTime().UnixNano() && e.Mode == mode {
+		if e != nil && e.Size == info.Size() && e.Mtime == info.ModTime().UnixNano() && sameMode(e.Mode, mode) {
 			continue
 		}
 		content, err := readContent(w.abs(p), mode)
@@ -315,7 +321,7 @@ func (w *Worktree) watchedStatus(idx Index) ([]FileStatus, bool) {
 		id := object.Hash(object.KindBlob, content)
 		state := byte('A')
 		if e != nil {
-			if e.Blob == id && e.Mode == mode {
+			if e.Blob == id && sameMode(e.Mode, mode) {
 				continue
 			}
 			state = 'M'

@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/VishiATChoudhary/graft/internal/client"
@@ -33,7 +32,7 @@ func cmdWatch(args []string) error {
 		}
 		pid, _ := strconv.Atoi(string(b))
 		os.Remove(pidFile)
-		return syscall.Kill(pid, syscall.SIGTERM)
+		return terminate(pid)
 	}
 	if *bg {
 		self, err := os.Executable()
@@ -47,7 +46,7 @@ func cmdWatch(args []string) error {
 		cmd := exec.Command(self, "watch")
 		cmd.Dir = root
 		cmd.Stdout, cmd.Stderr = logf, logf
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		detach(cmd)
 		if err := cmd.Start(); err != nil {
 			return err
 		}
@@ -61,7 +60,7 @@ func cmdWatch(args []string) error {
 		fmt.Printf("watching %s (pid %d)\n", root, cmd.Process.Pid)
 		return nil
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), stopSignals...)
 	defer cancel()
 	fmt.Printf("watching %s\n", root)
 	return watch.Run(ctx, root)

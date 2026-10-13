@@ -445,11 +445,11 @@ func (w *Worktree) locallyModified(p string, idx Index) bool {
 		return true // untracked file in the way
 	}
 	mode := modeOf(info)
-	if e.Size == info.Size() && e.Mtime == info.ModTime().UnixNano() && e.Mode == mode {
+	if e.Size == info.Size() && e.Mtime == info.ModTime().UnixNano() && sameMode(e.Mode, mode) {
 		return false
 	}
 	content, err := readContent(w.abs(p), mode)
-	return err != nil || object.Hash(object.KindBlob, content) != e.Blob || e.Mode != mode
+	return err != nil || object.Hash(object.KindBlob, content) != e.Blob || !sameMode(e.Mode, mode)
 }
 
 func pruneEmpty(dir, root string) {

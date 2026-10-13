@@ -6,19 +6,27 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: FUSE (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fuse3 && sudo chmod 666 /dev/fuse
       - run: go vet ./...
-      - run: test -z "$(gofmt -l .)"
+      - name: gofmt
+        if: runner.os != 'Windows'
+        run: test -z "$(gofmt -l .)"
       - run: go test -race ./...
       - name: repository tests against a 3-shard storage fleet
+        if: runner.os != 'Windows'
         run: GRAFT_TEST_SHARDS=3 go test -race ./internal/repo/
       - run: go build -o bin/gft ./cmd/gft
       - name: smoke test against git
+        if: runner.os != 'Windows'
         run: bench/smoke.sh

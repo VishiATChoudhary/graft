@@ -16,7 +16,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/VishiATChoudhary/graft/internal/acl"
@@ -146,7 +145,7 @@ func cmdServe(args []string) error {
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second}
 	log.Printf("gft %s tier listening on %s", *tier, *listen)
 	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(stop, stopSignals...)
 	go func() {
 		<-stop
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
