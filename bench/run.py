@@ -187,6 +187,28 @@ class Bench:
         for i in range(reps):
             clean(i)
 
+    def mount_read(self):
+        print("\n[mount-read] virtual checkout, then read one package (50 files)", flush=True)
+        pkg = "svc07/mod3/pkg4"
+        mnt = self.path("mnt")
+
+        def go(i):
+            state = self.path(f"mstate{i}")
+            shutil.rmtree(state, ignore_errors=True)
+            os.makedirs(mnt, exist_ok=True)
+            p = subprocess.Popen([GFT, "mount", self.tiers.server, mnt, "--objects", self.tiers.daemon, "--state", state],
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            for line in p.stdout:
+                if b"mounted at" in line:
+                    break
+            for root, _, files in os.walk(os.path.join(mnt, pkg)):
+                for f in files:
+                    with open(os.path.join(root, f), "rb") as fh:
+                        fh.read()
+            p.send_signal(signal.SIGINT)
+            p.wait()
+        self.measure("mount-read", "gft mount + read package (warm daemon)", go, server=True)
+
     def setup_clones(self):
         """Full clones used by history/update benchmarks."""
         self.gclone = self.fresh("gclone")
@@ -209,6 +231,18 @@ class Bench:
         run([GFT, "status"], cwd=self.fclone)
         self.measure("status", "git status", lambda i: run(["git", "-C", self.gclone, "status", "--porcelain"]))
         self.measure("status", "gft status", lambda i: run([GFT, "status"], cwd=self.fclone))
+        # With filesystem watchers: git's builtin fsmonitor daemon vs gft watch.
+        run(["git", "-C", self.gclone, "config", "core.fsmonitor", "true"])
+        run(["git", "-C", self.gclone, "config", "core.untrackedcache", "true"])
+        for _ in range(3):
+            run(["git", "-C", self.gclone, "status", "--porcelain"])
+        run([GFT, "watch", "--background"], cwd=self.fclone)
+        for _ in range(2):
+            run([GFT, "status"], cwd=self.fclone)
+        self.measure("status-watched", "git status (core.fsmonitor daemon)", lambda i: run(["git", "-C", self.gclone, "status", "--porcelain"]))
+        self.measure("status-watched", "gft status (gft watch)", lambda i: run([GFT, "status"], cwd=self.fclone))
+        run([GFT, "watch", "--stop"], cwd=self.fclone, check=False)
+        run(["git", "-C", self.gclone, "fsmonitor--daemon", "stop"], check=False)
 
     def history(self):
         g = self.gclone
@@ -324,6 +358,57 @@ class Bench:
         r["lands_per_s"] = r["lands"] / r["wall_s"]
         print(f"    -> {r['lands_per_s']:.1f} lands/s, {r['retries']} CAS retries (handled server-side)")
 
+    def fleet_land(self, agents=32, per_agent=4):
+        print(f"\n[land-fleet] {agents} agents x {per_agent} lands: 1 server vs 3 storage shards + 3 API servers", flush=True)
+        results = {}
+        for mode in ("single", "fleet"):
+            work = self.path("fleet-" + mode)
+            shutil.rmtree(work, ignore_errors=True)
+            os.makedirs(work)
+            procs = []
+            def start(args, url):
+                procs.append(subprocess.Popen([GFT] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                for _ in range(200):
+                    try:
+                        urllib.request.urlopen(url + "/v1/info").read()
+                        return
+                    except Exception:
+                        time.sleep(0.05)
+            if mode == "single":
+                start(["serve", "--tier", "server", "--data", os.path.join(work, "d"), "--listen", "127.0.0.1:7480"], "http://127.0.0.1:7480")
+                apis = ["http://127.0.0.1:7480"]
+            else:
+                nodes = ",".join(f"http://127.0.0.1:749{i}" for i in range(3))
+                for i in range(3):
+                    start(["serve", "--tier", "store", "--data", os.path.join(work, f"s{i}"), "--nodes", nodes, "--shard", str(i),
+                           "--listen", f"127.0.0.1:749{i}"], f"http://127.0.0.1:749{i}")
+                for i in range(3):
+                    start(["serve", "--tier", "server", "--store", nodes, "--listen", f"127.0.0.1:750{i}"], f"http://127.0.0.1:750{i}")
+                apis = [f"http://127.0.0.1:750{i}" for i in range(3)]
+            run([GFT, "write", "--server", apis[0], "--parent", "", "--land", "main", "-m", "init", "README=hello"])
+            def agent(a):
+                api = apis[a % len(apis)]
+                for k in range(per_agent):
+                    run([GFT, "write", "--server", api, "--parent", "main", "--land", "main", "-m", f"agent {a} change {k}",
+                         f"agents/{a}/{k}.txt=change {k}"])
+            ts = [threading.Thread(target=agent, args=(a,)) for a in range(agents)]
+            t0 = time.perf_counter()
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            wall = time.perf_counter() - t0
+            log = json.load(urllib.request.urlopen(apis[-1] + "/v1/resolve?rev=main"))
+            assert log["depth"] == agents * per_agent, f"{mode}: lost lands ({log['depth']})"
+            r = {"scenario": "land-fleet", "system": f"gft {mode} ({len(apis)} API server(s))", "wall_s": wall, "cpu_s": 0,
+                 "lands": agents * per_agent, "retries": 0, "lands_per_s": agents * per_agent / wall, "reps": 1}
+            self.results.append(r)
+            print(f"  {r['system']:<34} {wall*1000:10.1f} ms   {r['lands_per_s']:.1f} lands/s (verified linear)", flush=True)
+            for p in procs:
+                p.send_signal(signal.SIGTERM)
+            for p in procs:
+                p.wait()
+
     def footprint(self):
         def du(p):
             return int(run(["du", "-sk", p]).stdout.split()[0]) * 1024
@@ -370,7 +455,7 @@ def main():
     a = ap.parse_args()
     b = Bench(a)
     try:
-        steps = ["checkout_sparse", "checkout_full", "history_setup", "update", "status", "history", "concurrent_land", "footprint"]
+        steps = ["checkout_sparse", "checkout_full", "mount_read", "history_setup", "update", "status", "history", "concurrent_land", "fleet_land", "footprint"]
         only = set(a.only.split(",")) if a.only else None
         for s in steps:
             if s == "history_setup":

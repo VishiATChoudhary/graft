@@ -94,3 +94,49 @@ func TestMemLRUBudget(t *testing.T) {
 		t.Fatalf("over budget: %d", n)
 	}
 }
+
+// TestDeltaChainsStayBounded writes many versions of one object family and
+// checks every stored chain respects the depth cap (regression: a byte
+// depth counter once wrapped at 255, making chains unbounded).
+func TestDeltaChainsStayBounded(t *testing.T) {
+	db, err := OpenDB(t.TempDir(), 32<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var prev object.ID
+	var ids []object.ID
+	payload := bytes.Repeat([]byte("entry-name 0123456789abcdef0123456789abcdef\n"), 40)
+	for i := 0; i < 700; i++ {
+		p := append([]byte(fmt.Sprintf("version %d\n", i)), payload...)
+		id, stored := object.Encode(object.KindTree, p)
+		if err := db.PutBase(id, stored, prev); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+		prev = id
+	}
+	for _, id := range ids {
+		hops := 0
+		for cur := id; ; hops++ {
+			b, err := db.raw(cur)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, _ := parseRec(b)
+			if r.codec != codecDelta {
+				break
+			}
+			cur = r.base
+		}
+		if hops > maxDeltaDepth {
+			t.Fatalf("chain of %d deltas exceeds the cap of %d", hops, maxDeltaDepth)
+		}
+	}
+	db.payloads = NewMemLRU(1 << 20) // force real chain walks
+	for _, id := range []object.ID{ids[0], ids[350], ids[699]} {
+		if _, _, err := db.Payload(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

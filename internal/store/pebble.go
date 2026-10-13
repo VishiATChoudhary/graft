@@ -527,7 +527,7 @@ func (d *DB) deltaRecord(id object.ID, k object.Kind, p []byte, base object.ID, 
 		d.why[3].Add(1)
 		return nil
 	}
-	if info.Depth+1 > limit {
+	if int(info.Depth)+1 > int(limit) { // int: a byte would wrap at 255
 		d.why[4].Add(1)
 		return nil
 	}
