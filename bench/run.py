@@ -229,6 +229,11 @@ class Bench:
         self.measure("is-ancestor", "git merge-base --is-ancestor", lambda i: run(["git", "-C", g, "merge-base", "--is-ancestor", "main~19000", "main"]))
         self.measure("is-ancestor", "gft is-ancestor", lambda i: run([GFT, "is-ancestor", "main~19000", "main"] + s), server=True)
 
+        print("\n[grep] fixed-string search across all 100k files", flush=True)
+        self.measure("grep", "git grep -F (in full clone)", lambda i: run(["git", "-C", g, "grep", "-F", "-c", "rebase blame graph"], check=False))
+        run([GFT, "grep", "-F", "rebase blame graph"] + s)  # warm the server's caches
+        self.measure("grep", "gft grep -F (server-side, no clone)", lambda i: run([GFT, "grep", "-F", "rebase blame graph"] + s), server=True)
+
         print("\n[ci-diff] files changed in svc03/ between main~5000 and main", flush=True)
         self.measure("ci-diff", "git diff --name-only (in full clone)", lambda i: run(
             ["git", "-C", g, "diff", "--name-only", "main~5000", "main", "--", "svc03/"]))

@@ -131,6 +131,42 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/ls", s.wrap(s.ls))
 	mux.HandleFunc("/v1/cat", s.raw(s.cat, "read"))
 	mux.HandleFunc("/v1/search", s.wrap(s.search))
+	mux.HandleFunc("/v1/grep", s.wrap(s.grep))
+}
+
+// GrepResult is the response of /v1/grep.
+type GrepResult struct {
+	Matches   []repo.GrepMatch `json:"matches"`
+	Truncated bool             `json:"truncated"`
+}
+
+func (s *Server) grep(r *http.Request) (any, error) {
+	id, err := s.rev(r, "rev", "main")
+	if err != nil {
+		return nil, err
+	}
+	root, err := s.Repo.RootTree(id)
+	if err != nil {
+		return nil, err
+	}
+	q := r.URL.Query()
+	if q.Get("q") == "" {
+		return nil, badf("missing q")
+	}
+	if err := s.requireRead(r.Context(), q.Get("path")); err != nil {
+		return nil, err
+	}
+	opt := repo.GrepOptions{Pattern: q.Get("q"), Fixed: q.Get("fixed") == "1", IgnoreCase: q.Get("i") == "1",
+		Prefix: q.Get("path"), Limit: intParam(r, "limit", 1000)}
+	if s.ACL != nil {
+		ctx := r.Context()
+		opt.CanRead = func(p string) bool { return s.canRead(ctx, p) }
+	}
+	m, trunc, err := s.Repo.Grep(root, opt)
+	if err != nil {
+		return nil, badf("%v", err)
+	}
+	return GrepResult{m, trunc}, nil
 }
 
 // raw wraps a non-JSON handler with authentication and a repository-level

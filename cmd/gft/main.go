@@ -50,7 +50,8 @@ Repository queries (served by the server; no local history needed):
   gft is-ancestor <a> <b>
   gft ls [--rev R] [path]
   gft cat [--rev R] <path>
-  gft find [--rev R] [--in dir] <substring>
+  gft find [--rev R] [--in dir] <substring>                 search paths
+  gft grep [--rev R] [--in dir] [-i] [-F] [-n N] <regexp>   search file contents on the server
   gft refs
   gft write --parent R [--land REF] -m <msg> path=@file|path=-delete ...   commit without a checkout
 
@@ -124,6 +125,8 @@ func main() {
 		err = cmdCat(args)
 	case "find":
 		err = cmdFind(args)
+	case "grep":
+		err = cmdGrep(args)
 	case "refs":
 		err = cmdRefs(args)
 	case "write":
@@ -896,6 +899,34 @@ func cmdFind(args []string) error {
 	}
 	for _, p := range out {
 		fmt.Println(p)
+	}
+	return nil
+}
+
+func cmdGrep(args []string) error {
+	fs := flag.NewFlagSet("grep", flag.ExitOnError)
+	rev := fs.String("rev", "", "revision")
+	in := fs.String("in", "", "directory to search")
+	ic := fs.Bool("i", false, "ignore case")
+	fixed := fs.Bool("F", false, "fixed string")
+	n := fs.Int("n", 1000, "maximum matches")
+	server := fs.String("server", "", "server URL")
+	pos := parse(fs, args)
+	if len(pos) != 1 {
+		return errors.New("usage: gft grep <regexp>")
+	}
+	c, wt := apiClient(*server)
+	res, err := c.Grep(bg(), revOr(*rev, wt), pos[0], *in, *fixed, *ic, *n)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	for _, m := range res.Matches {
+		fmt.Fprintf(w, "%s:%d:%s\n", m.Path, m.Line, m.Text)
+	}
+	if res.Truncated {
+		fmt.Fprintf(w, "(stopped after %d matches)\n", len(res.Matches))
 	}
 	return nil
 }

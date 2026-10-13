@@ -224,6 +224,18 @@ func (c *Client) Search(ctx context.Context, rev, dir, q string, limit int) ([]s
 	return out, c.do(ctx, "GET", "/v1/search", url.Values{"rev": {rev}, "path": {dir}, "q": {q}, "limit": {fmt.Sprint(limit)}}, nil, &out)
 }
 
+func (c *Client) Grep(ctx context.Context, rev, pattern, dir string, fixed, ignoreCase bool, limit int) (*GrepResult, error) {
+	q := url.Values{"rev": {rev}, "q": {pattern}, "path": {dir}, "limit": {fmt.Sprint(limit)}}
+	if fixed {
+		q.Set("fixed", "1")
+	}
+	if ignoreCase {
+		q.Set("i", "1")
+	}
+	var out GrepResult
+	return &out, c.do(ctx, "GET", "/v1/grep", q, nil, &out)
+}
+
 func (c *Client) Info(ctx context.Context) (map[string]any, error) {
 	var out map[string]any
 	return out, c.do(ctx, "GET", "/v1/info", nil, nil, &out)

@@ -361,3 +361,23 @@ func TestMultipleAPIServers(t *testing.T) {
 		t.Fatalf("path log over fleet: %d %v", len(pl), err)
 	}
 }
+
+func TestGrep(t *testing.T) {
+	r := newRepo(t)
+	c := commit(t, r, nil, "g", map[string]string{"a/x.go": "package a\nfunc Foo() {}\n", "a/y.go": "package a\n// foo bar\n", "b/z.txt": "FOO\n"})
+	root, _ := r.RootTree(c)
+	m, _, err := r.Grep(root, GrepOptions{Pattern: "foo", IgnoreCase: true})
+	if err != nil || len(m) != 3 {
+		t.Fatalf("grep -i foo: %v %v", m, err)
+	}
+	m, _, _ = r.Grep(root, GrepOptions{Pattern: "Foo()", Fixed: true, Prefix: "a"})
+	if len(m) != 1 || m[0].Path != "a/x.go" || m[0].Line != 2 {
+		t.Fatalf("fixed grep: %v", m)
+	}
+	m, _, _ = r.Grep(root, GrepOptions{Pattern: "o", CanRead: func(p string) bool { return p != "b" }})
+	for _, x := range m {
+		if strings.HasPrefix(x.Path, "b/") {
+			t.Fatal("grep ignored access filter")
+		}
+	}
+}
