@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"path"
 	"sort"
 
 	"github.com/VishiATChoudhary/graft/internal/diff"
@@ -40,6 +41,7 @@ func (r *Repo) recordRenames(parent object.ID, seq uint64, changes []object.Chan
 	for _, ch := range changes {
 		byPath[ch.Path] = ch.Blob
 	}
+	r.crossPathDeltas(root, changes, src)
 	for np, op := range src {
 		v, err := r.lookupVersion(parent, op, true)
 		if err != nil {
@@ -234,4 +236,80 @@ func (r *Repo) inexactRenames(adds, dels []renameCand, src map[string]string) er
 		src[adds[p.a].path] = dels[p.d].path
 	}
 	return nil
+}
+
+// crossPathDeltas offers storage delta bases for files a changeset deletes
+// that were not detected as renames (for example a vendored library
+// upgraded into a new directory): an added file with the same name, or
+// else added files with the same extension and the closest size. The old
+// content becomes a delta against the new; nothing else changes.
+func (r *Repo) crossPathDeltas(parentRoot object.ID, changes []object.Change, renamed map[string]string) {
+	const maxDeleted = 5000
+	used := map[string]bool{}
+	for _, op := range renamed {
+		used[op] = true
+	}
+	type file struct {
+		path string
+		id   object.ID
+		size uint64
+	}
+	var added []file
+	byName := map[string][]int{}
+	byExt := map[string][]int{}
+	var dels []renameCand
+	for _, ch := range changes {
+		if ch.Mode == object.ModeFile || ch.Mode == object.ModeExec {
+			if _, err := r.Lookup(parentRoot, ch.Path); err == nil {
+				continue // modified, not added
+			}
+			n, _ := r.blobSize(ch.Blob)
+			i := len(added)
+			added = append(added, file{ch.Path, ch.Blob, n})
+			byName[path.Base(ch.Path)] = append(byName[path.Base(ch.Path)], i)
+			byExt[path.Ext(ch.Path)] = append(byExt[path.Ext(ch.Path)], i)
+			continue
+		}
+		if ch.Mode != object.ModeNone || len(dels) >= maxDeleted {
+			continue
+		}
+		e, err := r.Lookup(parentRoot, ch.Path)
+		if err != nil {
+			continue
+		}
+		if e.Mode == object.ModeDir {
+			r.expandFiles(ch.Path, e.ID, &dels)
+		} else if e.Mode == object.ModeFile || e.Mode == object.ModeExec {
+			dels = append(dels, renameCand{ch.Path, e.ID})
+		}
+	}
+	if len(added) == 0 {
+		return
+	}
+	for _, d := range dels {
+		if used[d.path] {
+			continue
+		}
+		cands := byName[path.Base(d.path)]
+		if len(cands) == 0 {
+			size, _ := r.blobSize(d.blob)
+			pool := append([]int(nil), byExt[path.Ext(d.path)]...)
+			dist := func(i int) uint64 {
+				if added[i].size > size {
+					return added[i].size - size
+				}
+				return size - added[i].size
+			}
+			sort.Slice(pool, func(a, b int) bool { return dist(pool[a]) < dist(pool[b]) })
+			if len(pool) > 2 {
+				pool = pool[:2]
+			}
+			cands = pool
+		}
+		for _, i := range cands {
+			if added[i].id != d.blob {
+				_ = r.DB.Deltify(d.blob, added[i].id)
+			}
+		}
+	}
 }

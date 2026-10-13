@@ -39,16 +39,12 @@ type DB struct {
 	seq      uint64
 	refLocks sync.Map
 
-	dictMu          sync.RWMutex
-	dictEnc         *zstd.Encoder
-	dictNo          uint32
-	dictDecs        map[uint32]*zstd.Decoder
-	sample          [][]byte
-	sampleIDs       []object.ID
-	sampleN         int
-	trainingStarted bool       // guarded by dictMu
-	trainMu         sync.Mutex // held while training; writers wait on it
-	dictFailed      atomic.Bool
+	// Trained zstd dictionaries, one per kind of object that benefits:
+	// blobs, and changesets (many small records sharing paths, authors
+	// and message phrasing).
+	dicts    map[object.Kind]*dictState
+	decMu    sync.RWMutex
+	dictDecs map[uint32]*zstd.Decoder
 
 	deltas, dicted atomic.Uint64
 	peers          BaseResolver
@@ -119,7 +115,11 @@ func OpenDB(dir string, cacheBytes int64) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{db: pdb, hot: NewMemLRU(cacheBytes / 4), payloads: NewMemLRU(cacheBytes / 4), dictDecs: map[uint32]*zstd.Decoder{}}
+	d := &DB{db: pdb, hot: NewMemLRU(cacheBytes / 4), payloads: NewMemLRU(cacheBytes / 4), dictDecs: map[uint32]*zstd.Decoder{},
+		dicts: map[object.Kind]*dictState{
+			object.KindBlob:      {kind: object.KindBlob, base: 0, samples: dictSamples, history: 112 << 10, maxLen: 64 << 10},
+			object.KindChangeset: {kind: object.KindChangeset, base: 1 << 20, samples: 1000, history: 32 << 10, maxLen: 64 << 10},
+		}}
 	if d.seq, err = d.lastLogSeq(); err != nil {
 		pdb.Close()
 		return nil, err
@@ -349,9 +349,9 @@ func (d *DB) decodeFull(r rec) (object.Kind, []byte, error) {
 	case 0, 1:
 		return object.Unpack(r.raw)
 	case codecDict:
-		d.dictMu.RLock()
+		d.decMu.RLock()
 		dec := d.dictDecs[r.dict]
-		d.dictMu.RUnlock()
+		d.decMu.RUnlock()
 		if dec == nil {
 			return 0, nil, fmt.Errorf("%w: unknown dictionary %d", object.ErrCorrupt, r.dict)
 		}
@@ -396,7 +396,11 @@ func (d *DB) write(id object.ID, record []byte) error {
 }
 
 func (d *DB) denseFull(id object.ID, stored []byte) []byte {
-	if len(stored) < 80 || object.Kind(stored[0]) != object.KindBlob {
+	if len(stored) < 80 {
+		return stored
+	}
+	ds := d.dicts[object.Kind(stored[0])]
+	if ds == nil {
 		return stored
 	}
 	_, p, err := object.Unpack(stored)
@@ -406,37 +410,18 @@ func (d *DB) denseFull(id object.ID, stored []byte) []byte {
 	if len(p) > 1<<20 {
 		// Too large for the dictionary: recompress harder instead (still
 		// the standard zstd stored form).
-		out := append([]byte{byte(object.KindBlob), 1}, bigEnc.EncodeAll(p, nil)...)
+		out := append([]byte{stored[0], 1}, bigEnc.EncodeAll(p, nil)...)
 		if len(out) < len(stored) {
 			return out
 		}
 		return stored
 	}
-	d.dictMu.RLock()
-	enc, no, sampled := d.dictEnc, d.dictNo, d.sampleN
-	d.dictMu.RUnlock()
-	if enc == nil && sampled >= dictSamples {
-		if d.dictFailed.Load() {
-			return stored
-		}
-		// Training in progress: wait for it, then use the dictionary.
-		d.trainMu.Lock()
-		d.trainMu.Unlock()
-		d.dictMu.RLock()
-		enc, no = d.dictEnc, d.dictNo
-		d.dictMu.RUnlock()
-		if enc == nil {
-			return stored
-		}
-	}
+	enc, no := ds.encoder(d, id, p)
 	if enc == nil {
-		if d.addSample(id, p) {
-			return d.denseFull(id, stored)
-		}
 		return stored
 	}
 	var e object.Encoder
-	e.Byte(byte(object.KindBlob))
+	e.Byte(stored[0])
 	e.Byte(codecDict)
 	e.Uvarint(uint64(no))
 	e.Uvarint(uint64(len(p)))
@@ -561,80 +546,99 @@ func (d *DB) deltaRecord(id object.ID, k object.Kind, p []byte, base object.ID, 
 
 // ---------------------------------------------------------------- dictionary
 
-// addSample collects blobs until there are enough to train the repository
-// dictionary, then trains it synchronously (concurrent writers wait, so the
-// bulk of an import is dictionary-compressed) and re-encodes the samples.
-// It reports whether a dictionary is now available.
-func (d *DB) addSample(id object.ID, p []byte) bool {
-	d.dictMu.Lock()
-	if d.dictEnc != nil {
-		d.dictMu.Unlock()
-		return true
-	}
-	if d.sampleN < dictSamples && len(p) >= 64 && len(p) <= 64<<10 {
-		d.sample = append(d.sample, bytes.Clone(p))
-		d.sampleIDs = append(d.sampleIDs, id)
-		d.sampleN++
-	}
-	ready := d.sampleN >= dictSamples
-	trainer := ready && !d.trainingStarted
-	if trainer {
-		// Taken before releasing dictMu, so any writer that sees the
-		// sample is full also sees training as in progress and waits.
-		d.trainingStarted = true
-		d.trainMu.Lock()
-	}
-	d.dictMu.Unlock()
-	if !ready {
-		return false
-	}
-	if trainer {
-		d.train()
-		d.trainMu.Unlock()
-	} else {
-		d.trainMu.Lock()
-		d.trainMu.Unlock()
-	}
-	d.dictMu.RLock()
-	defer d.dictMu.RUnlock()
-	return d.dictEnc != nil
+// dictState trains and holds the dictionary for one kind of object. The
+// first samples objects of the kind are collected; then the dictionary is
+// trained synchronously (concurrent writers wait, so the bulk of an import
+// is dictionary-compressed) and the samples are re-encoded with it.
+type dictState struct {
+	kind    object.Kind
+	base    uint32 // dictionary numbers for this kind start above base
+	samples int
+	history int // dictionary content size
+	maxLen  int // objects larger than this are not sampled
+
+	mu              sync.RWMutex
+	enc             *zstd.Encoder
+	no              uint32
+	sample          [][]byte
+	sampleIDs       []object.ID
+	trainingStarted bool
+	trainMu         sync.Mutex // held while training; writers wait on it
+	failed          atomic.Bool
 }
 
-func (d *DB) train() {
-	d.dictMu.RLock()
-	sample, ids := d.sample, d.sampleIDs
-	d.dictMu.RUnlock()
+// encoder returns the dictionary encoder for p, sampling p (and training
+// once enough samples arrived) if there is none yet.
+func (ds *dictState) encoder(d *DB, id object.ID, p []byte) (*zstd.Encoder, uint32) {
+	ds.mu.Lock()
+	if ds.enc != nil {
+		enc, no := ds.enc, ds.no
+		ds.mu.Unlock()
+		return enc, no
+	}
+	if ds.failed.Load() {
+		ds.mu.Unlock()
+		return nil, 0
+	}
+	if ds.trainingStarted {
+		ds.mu.Unlock()
+		ds.trainMu.Lock() // wait for the trainer
+		ds.trainMu.Unlock()
+		ds.mu.RLock()
+		defer ds.mu.RUnlock()
+		return ds.enc, ds.no
+	}
+	if len(p) >= 32 && len(p) <= ds.maxLen {
+		ds.sample = append(ds.sample, bytes.Clone(p))
+		ds.sampleIDs = append(ds.sampleIDs, id)
+	}
+	if len(ds.sample) < ds.samples {
+		ds.mu.Unlock()
+		return nil, 0
+	}
+	// This writer trains. trainMu is taken before releasing mu, so every
+	// writer that sees trainingStarted waits for the result.
+	ds.trainingStarted = true
+	ds.trainMu.Lock()
+	sample, ids := ds.sample, ds.sampleIDs
+	ds.mu.Unlock()
+	d.train(ds, sample, ids)
+	ds.trainMu.Unlock()
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	return ds.enc, ds.no
+}
+
+func (d *DB) train(ds *dictState, sample [][]byte, ids []object.ID) {
 	hist := bytes.Join(sample, nil)
-	if len(hist) > 112<<10 {
-		hist = hist[len(hist)-112<<10:]
+	if len(hist) > ds.history {
+		hist = hist[len(hist)-ds.history:]
 	}
-	no := uint32(1)
+	no := ds.base + 1
 	dict, err := zstd.BuildDict(zstd.BuildDictOptions{ID: no, Contents: sample, History: hist, Offsets: [3]int{1, 4, 8}})
+	if err == nil {
+		err = d.db.Set(key(pfxMeta, []byte("dict/"+strconv.Itoa(int(no)))), dict, pebble.Sync)
+	}
+	if err == nil {
+		err = d.installDict(no, dict)
+	}
 	if err != nil {
-		d.dictFailed.Store(true) // keep plain compression
+		ds.failed.Store(true) // keep plain compression
 		return
 	}
-	if err := d.db.Set(key(pfxMeta, []byte("dict/"+strconv.Itoa(int(no)))), dict, pebble.Sync); err != nil {
-		d.dictFailed.Store(true)
-		return
-	}
-	if err := d.installDict(no, dict); err != nil {
-		d.dictFailed.Store(true)
-		return
-	}
-	// Re-encode the sampled blobs that are still stored as plain zstd.
+	// Re-encode the sampled objects still stored as plain zstd.
 	for i, id := range ids {
 		b, err := d.raw(id)
 		if err != nil || len(b) < 2 || b[1] != 1 {
 			continue
 		}
-		if r := d.denseFull(id, object.Pack(object.KindBlob, sample[i])); len(r) > 1 && r[1] == codecDict {
+		if r := d.denseFull(id, object.Pack(ds.kind, sample[i])); len(r) > 1 && r[1] == codecDict {
 			d.write(id, r)
 		}
 	}
-	d.dictMu.Lock()
-	d.sample, d.sampleIDs = nil, nil
-	d.dictMu.Unlock()
+	ds.mu.Lock()
+	ds.sample, ds.sampleIDs = nil, nil
+	ds.mu.Unlock()
 }
 
 func (d *DB) installDict(no uint32, dict []byte) error {
@@ -647,13 +651,18 @@ func (d *DB) installDict(no uint32, dict []byte) error {
 	if err != nil {
 		return err
 	}
-	d.dictMu.Lock()
-	defer d.dictMu.Unlock()
+	d.decMu.Lock()
 	d.dictDecs[no] = dec
-	if no >= d.dictNo {
-		d.dictNo, d.dictEnc = no, enc
-		d.sampleN = dictSamples
-		d.trainingStarted = true
+	d.decMu.Unlock()
+	for _, ds := range d.dicts {
+		if no > ds.base && no <= ds.base+1<<20-1 {
+			ds.mu.Lock()
+			if no >= ds.no {
+				ds.no, ds.enc = no, enc
+				ds.trainingStarted = true
+			}
+			ds.mu.Unlock()
+		}
 	}
 	return nil
 }
@@ -842,9 +851,12 @@ func (d *DB) Compact() error {
 func (d *DB) Stats() map[string]any {
 	hh, hm, hb := d.hot.Stats()
 	ph, pm, pb := d.payloads.Stats()
-	d.dictMu.RLock()
-	dict := d.dictNo
-	d.dictMu.RUnlock()
+	dict := map[string]uint32{}
+	for k, ds := range d.dicts {
+		ds.mu.RLock()
+		dict[string(k)] = ds.no
+		ds.mu.RUnlock()
+	}
 	return map[string]any{
 		"hot_cache":     map[string]any{"hits": hh, "misses": hm, "bytes": hb},
 		"payload_cache": map[string]any{"hits": ph, "misses": pm, "bytes": pb},

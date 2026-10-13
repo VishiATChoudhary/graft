@@ -181,7 +181,7 @@ func (r *Repo) reverseDeltify(old, new object.ID, size uint64) {
 	_ = r.DB.Deltify(old, new)
 }
 
-const keyframeBudget = 64 << 20
+const keyframeBudget = 256 << 20
 
 func (r *Repo) blobSize(id object.ID) (uint64, error) {
 	n, err := r.DB.PayloadSize(id)
