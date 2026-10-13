@@ -71,6 +71,26 @@ func Unpack(stored []byte) (Kind, []byte, error) {
 	return 0, nil, fmt.Errorf("%w: unknown codec %d", ErrCorrupt, stored[1])
 }
 
+// PayloadSize returns the uncompressed payload size of a stored object,
+// reading only the zstd frame header when possible.
+func PayloadSize(stored []byte) (uint64, error) {
+	if len(stored) < 2 {
+		return 0, fmt.Errorf("%w: short object", ErrCorrupt)
+	}
+	switch stored[1] {
+	case codecRaw:
+		return uint64(len(stored) - 2), nil
+	case codecZstd:
+		var h zstd.Header
+		if err := h.Decode(stored[2:]); err == nil && h.HasFCS {
+			return h.FrameContentSize, nil
+		}
+		_, p, err := Unpack(stored)
+		return uint64(len(p)), err
+	}
+	return 0, fmt.Errorf("%w: unknown codec %d", ErrCorrupt, stored[1])
+}
+
 // Verify unpacks a stored object and checks it hashes to id.
 func Verify(id ID, stored []byte) (Kind, []byte, error) {
 	k, p, err := Unpack(stored)

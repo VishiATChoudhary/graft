@@ -28,6 +28,7 @@ const usage = `gft: source control for agent-scale monorepos
 
 Working copy:
   gft clone <server> <dir> [--sparse dir]... [--objects endpoint] [--rev main]
+  gft mount <server> <dir> [--rev R]  virtual read-only checkout: files fetched on first read
   gft checkout <rev> [--force]       move the working copy (only changed files are touched)
   gft sparse list|add|set <dir>...   change which directories are materialized
   gft status                         local modifications
@@ -76,6 +77,8 @@ func main() {
 		err = cmdImport(args)
 	case "clone":
 		err = cmdClone(args)
+	case "mount":
+		err = cmdMount(args)
 	case "checkout", "co":
 		err = cmdCheckout(args)
 	case "sparse":

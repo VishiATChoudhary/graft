@@ -91,9 +91,12 @@ func (d *Decoder) String() string { return string(d.Bytes()) }
 
 // TreeEntry is one name in a directory.
 type TreeEntry struct {
-	Name string
-	Mode Mode
-	ID   ID
+	Name string `json:"name"`
+	Mode Mode   `json:"mode"`
+	ID   ID     `json:"id"`
+	// Size is the content length for files (0 for directories). Keeping it
+	// in the tree lets virtual checkouts answer stat without fetching blobs.
+	Size uint64 `json:"size,omitempty"`
 }
 
 // Tree is a directory listing sorted by name.
@@ -121,6 +124,9 @@ func (t *Tree) Encode() []byte {
 		e.String(en.Name)
 		e.Byte(byte(en.Mode))
 		e.ID(en.ID)
+		if en.Mode != ModeDir {
+			e.Uvarint(en.Size)
+		}
 	}
 	return e.B
 }
@@ -137,6 +143,9 @@ func DecodeTree(b []byte) (*Tree, error) {
 		en.Name = d.String()
 		en.Mode = Mode(d.Byte())
 		en.ID = d.ID()
+		if en.Mode != ModeDir {
+			en.Size = d.Uvarint()
+		}
 		t.Entries = append(t.Entries, en)
 	}
 	return t, d.Err

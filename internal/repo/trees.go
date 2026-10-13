@@ -80,7 +80,11 @@ func (r *Repo) applyTree(base object.ID, changes []object.Change) (object.ID, er
 			if g.direct.Mode == object.ModeNone {
 				delete(entries, g.name)
 			} else {
-				entries[g.name] = object.TreeEntry{Name: g.name, Mode: g.direct.Mode, ID: g.direct.Blob}
+				size, err := r.blobSize(g.direct.Blob)
+				if err != nil {
+					return object.Zero, err
+				}
+				entries[g.name] = object.TreeEntry{Name: g.name, Mode: g.direct.Mode, ID: g.direct.Blob, Size: size}
 			}
 			continue
 		}
@@ -108,6 +112,14 @@ func (r *Repo) applyTree(base object.ID, changes []object.Change) (object.ID, er
 	}
 	nt.Sort()
 	return store.WriteTree(r.DB, nt)
+}
+
+func (r *Repo) blobSize(id object.ID) (uint64, error) {
+	b, err := r.DB.Get(id)
+	if err != nil {
+		return 0, fmt.Errorf("blob %s: %w", id.Short(), err)
+	}
+	return object.PayloadSize(b)
 }
 
 // Lookup resolves a path within a root tree. An empty path returns the root
