@@ -254,6 +254,25 @@ func (c *Changeset) Normalize() error {
 	}
 	c.Changes = out
 	sort.Slice(c.Changes, func(i, j int) bool { return c.Changes[i].Path < c.Changes[j].Path })
+	// A path cannot be written as a file while also having children written.
+	files := map[string]bool{}
+	for _, ch := range c.Changes {
+		if ch.Mode != ModeNone {
+			files[ch.Path] = true
+		}
+	}
+	for _, ch := range c.Changes {
+		for p := ch.Path; ; {
+			i := strings.LastIndexByte(p, '/')
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+			if files[p] {
+				return fmt.Errorf("%q is both a file and a directory", p)
+			}
+		}
+	}
 	return nil
 }
 

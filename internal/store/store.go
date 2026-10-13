@@ -21,11 +21,17 @@ type Objects interface {
 
 // ReadPayload fetches and unpacks an object of the expected kind.
 func ReadPayload(s Objects, id object.ID, want object.Kind) ([]byte, error) {
-	b, err := s.Get(id)
-	if err != nil {
-		return nil, err
+	var k object.Kind
+	var p []byte
+	var err error
+	if pr, ok := s.(payloadReader); ok {
+		k, p, err = pr.Payload(id)
+	} else {
+		var b []byte
+		if b, err = s.Get(id); err == nil {
+			k, p, err = object.Unpack(b)
+		}
 	}
-	k, p, err := object.Unpack(b)
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +57,12 @@ func ReadTree(s Objects, id object.ID) (*object.Tree, error) {
 
 func WriteTree(s Objects, t *object.Tree) (object.ID, error) {
 	return WritePayload(s, object.KindTree, t.Encode())
+}
+
+// WritePayloadBase is WritePayload with a delta-base storage hint.
+func WritePayloadBase(s Backend, k object.Kind, payload []byte, base object.ID) (object.ID, error) {
+	id, stored := object.Encode(k, payload)
+	return id, s.PutBase(id, stored, base)
 }
 
 func ReadChangeset(s Objects, id object.ID) (*object.Changeset, error) {

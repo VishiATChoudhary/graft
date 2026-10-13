@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 
 	"github.com/VishiATChoudhary/graft/internal/derive"
 	"github.com/VishiATChoudhary/graft/internal/object"
@@ -21,7 +19,7 @@ import (
 
 // Repo is one repository backed by a store.DB.
 type Repo struct {
-	DB  *store.DB
+	DB  store.Backend
 	eng *derive.Engine
 
 	root  *derive.Type // changeset -> root tree ID
@@ -29,8 +27,6 @@ type Repo struct {
 	unode *derive.Type // changeset -> root history unode
 	blame *derive.Type // file unode -> blame runs (lazy)
 
-	seq      atomic.Uint64
-	refLocks sync.Map // name -> *sync.Mutex; CAS is per ref, never global
 }
 
 var (
@@ -42,7 +38,7 @@ var (
 )
 
 // Open opens a repository over an existing DB.
-func Open(db *store.DB) (*Repo, error) {
+func Open(db store.Backend) (*Repo, error) {
 	r := &Repo{DB: db, eng: derive.NewEngine(db)}
 	csParents := func(id object.ID) ([]object.ID, error) {
 		cs, err := r.Changeset(id)
@@ -55,11 +51,6 @@ func Open(db *store.DB) (*Repo, error) {
 	r.root = r.eng.Register(&derive.Type{Name: "root", Eager: true, Parents: csParents, Compute: r.computeRoot}, 16<<20)
 	r.unode = r.eng.Register(&derive.Type{Name: "unode", Eager: true, Parents: csParents, Compute: r.computeUnode}, 16<<20)
 	r.blame = r.eng.Register(&derive.Type{Name: "blame", Eager: false, Parents: r.blameParents, Compute: r.computeBlame}, 128<<20)
-	last, err := db.LastLogSeq()
-	if err != nil {
-		return nil, err
-	}
-	r.seq.Store(last)
 	return r, nil
 }
 
@@ -73,7 +64,10 @@ func (r *Repo) Changeset(id object.ID) (*object.Changeset, error) {
 }
 
 // LogSize is the number of changesets in the write-ahead log.
-func (r *Repo) LogSize() uint64 { return r.seq.Load() }
+func (r *Repo) LogSize() uint64 {
+	n, _ := r.DB.LastLogSeq()
+	return n
+}
 
 // Create validates and appends a changeset to the log, then computes eager
 // derived data. Cost scales with the size of the change, not the repo.
@@ -111,13 +105,16 @@ func (r *Repo) append(cs *object.Changeset) (object.ID, error) {
 	if err := r.DB.Put(id, stored); err != nil {
 		return object.Zero, err
 	}
+	// Log first: derived data refers to changesets by log sequence. Eager
+	// types are then computed; if that is interrupted they are recomputed
+	// on demand, since derived data is always derivable.
+	if _, err := r.DB.AppendLog(id); err != nil {
+		return object.Zero, err
+	}
 	for _, t := range r.eng.EagerTypes() {
 		if _, err := r.eng.Get(t, id); err != nil {
 			return object.Zero, err
 		}
-	}
-	if err := r.DB.AppendLog(r.seq.Add(1), id); err != nil {
-		return object.Zero, err
 	}
 	return id, nil
 }
@@ -151,13 +148,9 @@ func (r *Repo) computeRoot(id object.ID, parents []object.ID, vals [][]byte) ([]
 
 // Refs.
 
-func (r *Repo) refLock(name string) *sync.Mutex {
-	m, _ := r.refLocks.LoadOrStore(name, &sync.Mutex{})
-	return m.(*sync.Mutex)
-}
-
 // UpdateRef performs a compare-and-swap on a single ref. old == Zero means
-// the ref must not exist; new == Zero deletes it.
+// the ref must not exist; new == Zero deletes it. The swap happens in the
+// backend on one row, so any number of API servers can share a repository.
 func (r *Repo) UpdateRef(name string, old, new object.ID) error {
 	if err := validRefName(name); err != nil {
 		return err
@@ -167,20 +160,12 @@ func (r *Repo) UpdateRef(name string, old, new object.ID) error {
 			return fmt.Errorf("%w: %s", ErrBadRev, new.Short())
 		}
 	}
-	mu := r.refLock(name)
-	mu.Lock()
-	defer mu.Unlock()
-	cur, err := r.DB.GetRef(name)
-	if err == object.ErrNotFound {
-		cur, err = object.Zero, nil
+	err := r.DB.CASRef(name, old, new)
+	var rm *store.RefMismatch
+	if errors.As(err, &rm) {
+		return fmt.Errorf("%w: %v", ErrStaleRef, rm)
 	}
-	if err != nil {
-		return err
-	}
-	if cur != old {
-		return fmt.Errorf("%w: %s is %s, expected %s", ErrStaleRef, name, cur.Short(), old.Short())
-	}
-	return r.DB.SetRef(name, new)
+	return err
 }
 
 func (r *Repo) Ref(name string) (object.ID, error) { return r.DB.GetRef(name) }

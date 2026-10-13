@@ -2,6 +2,7 @@ package repo
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 
@@ -84,6 +85,17 @@ func (r *Repo) applyTree(base object.ID, changes []object.Change) (object.ID, er
 				if err != nil {
 					return object.Zero, err
 				}
+				if exists && cur.Mode != object.ModeDir && cur.ID != g.direct.Blob && g.direct.Mode != object.ModeGitlink {
+					// Storage hint: keep the new version as a delta
+					// against the previous version of this path.
+					_ = r.DB.Deltify(g.direct.Blob, cur.ID)
+				} else if !exists && g.direct.Mode == object.ModeFile {
+					sib := make([]object.TreeEntry, 0, len(entries))
+					for _, e := range entries {
+						sib = append(sib, e)
+					}
+					r.deltifyNewFile(g.name, g.direct.Blob, size, sib)
+				}
 				entries[g.name] = object.TreeEntry{Name: g.name, Mode: g.direct.Mode, ID: g.direct.Blob, Size: size}
 			}
 			continue
@@ -111,15 +123,44 @@ func (r *Repo) applyTree(base object.ID, changes []object.Change) (object.ID, er
 		nt.Entries = append(nt.Entries, e)
 	}
 	nt.Sort()
-	return store.WriteTree(r.DB, nt)
+	return store.WritePayloadBase(r.DB, object.KindTree, nt.Encode(), base)
+}
+
+// deltifyNewFile picks delta bases for a file with no previous version:
+// up to three siblings with the same extension and the closest sizes (a
+// cheap stand-in for git's similarity window). Deltify keeps the smallest.
+func (r *Repo) deltifyNewFile(name string, blob object.ID, size uint64, siblings []object.TreeEntry) {
+	ext := path.Ext(name)
+	type cand struct {
+		id   object.ID
+		dist uint64
+	}
+	var cs []cand
+	for _, e := range siblings {
+		if e.Mode != object.ModeFile && e.Mode != object.ModeExec || e.ID == blob || path.Ext(e.Name) != ext {
+			continue
+		}
+		if e.Size*2 < size || size*2 < e.Size {
+			continue
+		}
+		dist := e.Size - size
+		if size > e.Size {
+			dist = size - e.Size
+		}
+		cs = append(cs, cand{e.ID, dist})
+	}
+	sort.Slice(cs, func(i, j int) bool { return cs[i].dist < cs[j].dist })
+	for i := 0; i < len(cs) && i < 3; i++ {
+		_ = r.DB.Deltify(blob, cs[i].id)
+	}
 }
 
 func (r *Repo) blobSize(id object.ID) (uint64, error) {
-	b, err := r.DB.Get(id)
+	n, err := r.DB.PayloadSize(id)
 	if err != nil {
 		return 0, fmt.Errorf("blob %s: %w", id.Short(), err)
 	}
-	return object.PayloadSize(b)
+	return n, nil
 }
 
 // Lookup resolves a path within a root tree. An empty path returns the root

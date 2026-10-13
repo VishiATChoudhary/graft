@@ -96,7 +96,11 @@ func Import(ctx context.Context, r *repo.Repo, opt Options) (*Stats, error) {
 			return &imp.stats, err
 		}
 	}
-	if err := r.DB.Flush(); err != nil {
+	if c, ok := r.DB.(interface{ Compact() error }); ok {
+		if err := c.Compact(); err != nil {
+			return &imp.stats, err
+		}
+	} else if err := r.DB.Flush(); err != nil {
 		return &imp.stats, err
 	}
 	imp.stats.Elapsed = time.Since(imp.start)

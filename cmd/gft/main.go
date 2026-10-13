@@ -268,6 +268,12 @@ func cmdImport(args []string) error {
 		return err
 	}
 	fmt.Printf("imported %d changesets, %d blobs (%.1f MB) in %s\n", st.Changesets, st.Blobs, float64(st.BlobBytes)/1e6, st.Elapsed.Round(time.Millisecond))
+	// Reopen once so pebble drops write-ahead log files left from the bulk load.
+	db.Close()
+	if db, err = store.OpenDB(*data, 64<<20); err != nil {
+		return err
+	}
+	time.Sleep(200 * time.Millisecond) // obsolete files are deleted asynchronously
 	return nil
 }
 

@@ -25,8 +25,40 @@ type renameCand struct {
 	blob object.ID
 }
 
-// detectRenames returns new path -> source file unode (in parent's history).
-func (r *Repo) detectRenames(parent, parentUnode object.ID, changes []object.Change) (map[string]object.ID, error) {
+// recordRenames stores, for each path a changeset renamed, the source
+// path version (derived data keyed by the new path version).
+func (r *Repo) recordRenames(parent, _ object.ID, seq uint64, changes []object.Change) error {
+	src, err := r.detectRenames(parent, changes)
+	if err != nil {
+		return err
+	}
+	root, err := r.RootTree(parent)
+	if err != nil {
+		return err
+	}
+	byPath := map[string]object.ID{}
+	for _, ch := range changes {
+		byPath[ch.Path] = ch.Blob
+	}
+	for np, op := range src {
+		v, err := r.lookupVersion(parent, op, true)
+		if err != nil {
+			continue
+		}
+		// Storage hint: a renamed file is a good delta base for its new
+		// content (most new files have no previous version to delta from).
+		if e, err := r.Lookup(root, op); err == nil && e.ID != byPath[np] {
+			_ = r.DB.Deltify(byPath[np], e.ID)
+		}
+		if err := r.DB.PutDerived("copy", versionKey(np, seq), encodeVersion(op, v.link)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// detectRenames returns new path -> source path.
+func (r *Repo) detectRenames(parent object.ID, changes []object.Change) (map[string]string, error) {
 	root, err := r.RootTree(parent)
 	if err != nil {
 		return nil, err
@@ -92,15 +124,7 @@ func (r *Repo) detectRenames(parent, parentUnode object.ID, changes []object.Cha
 			return nil, err
 		}
 	}
-	out := make(map[string]object.ID, len(src))
-	for np, op := range src {
-		id, _, err := r.lookupUnodeIn(parentUnode, op, true)
-		if err != nil {
-			continue
-		}
-		out[np] = id
-	}
-	return out, nil
+	return src, nil
 }
 
 func (r *Repo) expandFiles(dir string, tree object.ID, out *[]renameCand) error {

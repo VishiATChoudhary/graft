@@ -13,33 +13,22 @@ type BlameLine struct {
 	Line      int       `json:"line"` // 1-based line number in the attributed changeset's version
 }
 
-// Blame runs: blame for a file unode is stored as runs of consecutive lines
-// sharing a changeset, with their original line numbers.
+// Blame is derived per file version (path, link seq) and stored as runs of
+// consecutive lines sharing a changeset, with their original line numbers.
+// A version's blame is computed from its previous versions' blame plus a
+// line diff, so each version is diffed once, ever.
 type blameRun struct {
 	n    int
-	cs   object.ID
-	orig int // 0-based line number in cs's version of the file
+	seq  uint64
+	orig int // 0-based line number in seq's version of the file
 }
 
 func encodeBlame(runs []blameRun) []byte {
 	var e object.Encoder
-	// Changeset table, then runs referencing it.
-	idx := map[object.ID]int{}
-	var tbl []object.ID
-	for _, r := range runs {
-		if _, ok := idx[r.cs]; !ok {
-			idx[r.cs] = len(tbl)
-			tbl = append(tbl, r.cs)
-		}
-	}
-	e.Uvarint(uint64(len(tbl)))
-	for _, id := range tbl {
-		e.ID(id)
-	}
 	e.Uvarint(uint64(len(runs)))
 	for _, r := range runs {
 		e.Uvarint(uint64(r.n))
-		e.Uvarint(uint64(idx[r.cs]))
+		e.Uvarint(r.seq)
 		e.Uvarint(uint64(r.orig))
 	}
 	return e.B
@@ -51,21 +40,9 @@ func decodeBlame(b []byte) ([]blameRun, error) {
 	if n > uint64(len(b)) {
 		return nil, object.ErrCorrupt
 	}
-	tbl := make([]object.ID, 0, n)
-	for i := uint64(0); i < n && d.Err == nil; i++ {
-		tbl = append(tbl, d.ID())
-	}
-	n = d.Uvarint()
-	if n > uint64(len(b)) {
-		return nil, object.ErrCorrupt
-	}
 	runs := make([]blameRun, 0, n)
 	for i := uint64(0); i < n && d.Err == nil; i++ {
-		cnt, ci, orig := d.Uvarint(), d.Uvarint(), d.Uvarint()
-		if ci >= uint64(len(tbl)) {
-			return nil, object.ErrCorrupt
-		}
-		runs = append(runs, blameRun{int(cnt), tbl[ci], int(orig)})
+		runs = append(runs, blameRun{int(d.Uvarint()), d.Uvarint(), int(d.Uvarint())})
 	}
 	return runs, d.Err
 }
@@ -74,7 +51,7 @@ func expandBlame(runs []blameRun) []blameRun {
 	var out []blameRun
 	for _, r := range runs {
 		for k := 0; k < r.n; k++ {
-			out = append(out, blameRun{1, r.cs, r.orig + k})
+			out = append(out, blameRun{1, r.seq, r.orig + k})
 		}
 	}
 	return out
@@ -83,7 +60,7 @@ func expandBlame(runs []blameRun) []blameRun {
 func compressBlame(lines []blameRun) []blameRun {
 	var out []blameRun
 	for _, l := range lines {
-		if n := len(out); n > 0 && out[n-1].cs == l.cs && out[n-1].orig+out[n-1].n == l.orig {
+		if n := len(out); n > 0 && out[n-1].seq == l.seq && out[n-1].orig+out[n-1].n == l.orig {
 			out[n-1].n++
 			continue
 		}
@@ -92,61 +69,101 @@ func compressBlame(lines []blameRun) []blameRun {
 	return out
 }
 
-// blameParents: the previous versions of the same path, then the rename
-// source. A tombstone ends the chain: a re-added file's lines are new.
-func (r *Repo) blameParents(id object.ID) ([]object.ID, error) {
-	u, err := r.readUnode(id)
+// registerVersion records how to decode a version key, so the derived-data
+// engine (which works on IDs) can find a version's parents.
+func (r *Repo) registerVersion(path string, link uint64) (object.ID, error) {
+	k := versionKey(path, link)
+	if _, err := r.DB.GetDerived("version", k); err == nil {
+		return k, nil
+	}
+	return k, r.DB.PutDerived("version", k, encodeVersion(path, link))
+}
+
+func (r *Repo) versionOf(k object.ID) (string, uint64, error) {
+	v, err := r.DB.GetDerived("version", k)
+	if err != nil {
+		return "", 0, err
+	}
+	return decodeVersion(v)
+}
+
+// blameParents: the previous versions of the path (live ones only: a
+// re-added file's lines are new), then the rename source.
+func (r *Repo) blameParents(k object.ID) ([]object.ID, error) {
+	path, link, err := r.versionOf(k)
 	if err != nil {
 		return nil, err
 	}
-	if u.Dir {
-		return nil, fmt.Errorf("blame of a directory")
+	prev, err := r.previousVersions(pathVersion{path: path, link: link}, true)
+	if err != nil {
+		return nil, err
 	}
-	if u.Deleted {
-		return nil, nil
-	}
-	var ps []object.ID
-	for _, p := range u.Parents {
-		pu, err := r.readUnode(p)
+	var out []object.ID
+	for _, p := range prev {
+		if p.dir {
+			continue
+		}
+		id, err := r.registerVersion(p.path, p.link)
 		if err != nil {
 			return nil, err
 		}
-		if !pu.Deleted {
-			ps = append(ps, p)
+		out = append(out, id)
+	}
+	if src, ok, err := r.copySource(path, link); err != nil {
+		return nil, err
+	} else if ok {
+		id, err := r.registerVersion(src.path, src.link)
+		if err != nil {
+			return nil, err
 		}
+		out = append(out, id)
 	}
-	if !u.CopyFrom.IsZero() {
-		ps = append(ps, u.CopyFrom)
-	}
-	return ps, nil
+	return out, nil
 }
 
-func (r *Repo) computeBlame(id object.ID, parents []object.ID, vals [][]byte) ([]byte, error) {
-	u, err := r.readUnode(id)
+// versionContent returns the file content of a path version.
+func (r *Repo) versionContent(path string, link uint64) ([]byte, error) {
+	cs, err := r.DB.LogID(link)
 	if err != nil {
 		return nil, err
 	}
-	if u.Deleted {
-		return encodeBlame(nil), nil
+	root, err := r.RootTree(cs)
+	if err != nil {
+		return nil, err
 	}
-	content, err := r.ReadBlob(u.Blob)
+	e, err := r.Lookup(root, path)
+	if err != nil {
+		return nil, err
+	}
+	if e.Mode == object.ModeDir {
+		return nil, fmt.Errorf("%q is a directory", path)
+	}
+	return r.ReadBlob(e.ID)
+}
+
+func (r *Repo) computeBlame(k object.ID, parents []object.ID, vals [][]byte) ([]byte, error) {
+	path, link, err := r.versionOf(k)
+	if err != nil {
+		return nil, err
+	}
+	content, err := r.versionContent(path, link)
 	if err != nil {
 		return nil, err
 	}
 	lines := diff.SplitLines(content)
 	attr := make([]blameRun, len(lines))
 	for i := range attr {
-		attr[i] = blameRun{1, u.Link, i}
+		attr[i] = blameRun{1, link, i}
 	}
 	assigned := make([]bool, len(lines))
 	for pi, p := range parents {
-		pu, err := r.readUnode(p)
+		pp, pl, err := r.versionOf(p)
 		if err != nil {
 			return nil, err
 		}
-		pc, err := r.ReadBlob(pu.Blob)
+		pc, err := r.versionContent(pp, pl)
 		if err != nil {
-			return nil, err
+			continue
 		}
 		pruns, err := decodeBlame(vals[pi])
 		if err != nil {
@@ -154,10 +171,10 @@ func (r *Repo) computeBlame(id object.ID, parents []object.ID, vals [][]byte) ([
 		}
 		plines := expandBlame(pruns)
 		for _, m := range diff.Lines(diff.SplitLines(pc), lines) {
-			for k := 0; k < m.N; k++ {
-				if !assigned[m.B+k] && m.A+k < len(plines) {
-					attr[m.B+k] = plines[m.A+k]
-					assigned[m.B+k] = true
+			for t := 0; t < m.N; t++ {
+				if !assigned[m.B+t] && m.A+t < len(plines) {
+					attr[m.B+t] = plines[m.A+t]
+					assigned[m.B+t] = true
 				}
 			}
 		}
@@ -166,27 +183,39 @@ func (r *Repo) computeBlame(id object.ID, parents []object.ID, vals [][]byte) ([
 }
 
 // Blame attributes each line of path at rev to the changeset that
-// introduced it. Results are memoized per file version, and computed
+// introduced it. Results are memoized per file version and computed
 // incrementally from the previous version's blame.
 func (r *Repo) Blame(rev object.ID, path string) ([]BlameLine, error) {
-	id, u, err := r.lookupUnode(rev, path, true)
+	v, err := r.lookupVersion(rev, path, true)
 	if err != nil {
 		return nil, err
 	}
-	if u.Dir {
+	if v.dir {
 		return nil, fmt.Errorf("%q is a directory", path)
 	}
-	v, err := r.eng.Get(r.blame, id)
+	k, err := r.registerVersion(v.path, v.link)
 	if err != nil {
 		return nil, err
 	}
-	runs, err := decodeBlame(v)
+	val, err := r.eng.Get(r.blame, k)
 	if err != nil {
 		return nil, err
 	}
+	runs, err := decodeBlame(val)
+	if err != nil {
+		return nil, err
+	}
+	ids := map[uint64]object.ID{}
 	var out []BlameLine
 	for _, l := range expandBlame(runs) {
-		out = append(out, BlameLine{l.cs, l.orig + 1})
+		id, ok := ids[l.seq]
+		if !ok {
+			if id, err = r.DB.LogID(l.seq); err != nil {
+				return nil, err
+			}
+			ids[l.seq] = id
+		}
+		out = append(out, BlameLine{id, l.orig + 1})
 	}
 	return out, nil
 }

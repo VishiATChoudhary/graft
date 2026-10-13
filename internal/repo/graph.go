@@ -12,13 +12,15 @@ import (
 //   - Gen is the generation number: 1 + max(parent generations). An ancestor
 //     always has a strictly smaller generation, which bounds graph walks.
 //   - Depth is the first-parent depth (root = 0).
-//   - Skips[k] is the first-parent ancestor 2^k steps back, giving O(log n)
-//     jumps along the trunk.
+//   - Skips[k] is the log sequence number of the first-parent ancestor 2^k
+//     steps back, giving O(log n) jumps along the trunk. Sequence numbers
+//     (a few bytes as varints) rather than 32-byte IDs keep the commit graph
+//     small.
 type GraphNode struct {
 	Gen     uint64
 	Depth   uint64
 	Parents []object.ID
-	Skips   []object.ID
+	Skips   []uint64
 }
 
 func encodeGraph(g *GraphNode) []byte {
@@ -31,7 +33,7 @@ func encodeGraph(g *GraphNode) []byte {
 	}
 	e.Uvarint(uint64(len(g.Skips)))
 	for _, s := range g.Skips {
-		e.ID(s)
+		e.Uvarint(s)
 	}
 	return e.B
 }
@@ -45,7 +47,7 @@ func decodeGraph(b []byte) (*GraphNode, error) {
 	}
 	n = d.Uvarint()
 	for i := uint64(0); i < n && d.Err == nil; i++ {
-		g.Skips = append(g.Skips, d.ID())
+		g.Skips = append(g.Skips, d.Uvarint())
 	}
 	return g, d.Err
 }
@@ -67,14 +69,15 @@ func (r *Repo) computeGraph(id object.ID, parents []object.ID, vals [][]byte) ([
 			return nil, err
 		}
 		g.Depth = p1.Depth + 1
-		g.Skips = append(g.Skips, parents[0])
+		s0, err := r.DB.LogSeq(parents[0])
+		if err != nil {
+			return nil, err
+		}
+		g.Skips = append(g.Skips, s0)
 		// skip[k] = skip[k-1] of skip[k-1]. Ancestors are always derived
 		// before descendants, so these lookups never recurse deeply.
-		for k := 1; ; k++ {
-			if uint64(1)<<k > g.Depth {
-				break
-			}
-			mid, err := r.Graph(g.Skips[k-1])
+		for k := 1; uint64(1)<<k <= g.Depth; k++ {
+			mid, err := r.graphAtSeq(g.Skips[k-1])
 			if err != nil {
 				return nil, err
 			}
@@ -96,6 +99,14 @@ func (r *Repo) Graph(id object.ID) (*GraphNode, error) {
 	return decodeGraph(v)
 }
 
+func (r *Repo) graphAtSeq(seq uint64) (*GraphNode, error) {
+	id, err := r.DB.LogID(seq)
+	if err != nil {
+		return nil, err
+	}
+	return r.Graph(id)
+}
+
 // jump walks the first-parent chain from id back to the given depth.
 func (r *Repo) jump(id object.ID, depth uint64) (object.ID, error) {
 	g, err := r.Graph(id)
@@ -108,7 +119,9 @@ func (r *Repo) jump(id object.ID, depth uint64) (object.ID, error) {
 		for k+1 < len(g.Skips) && uint64(1)<<(k+1) <= dist {
 			k++
 		}
-		id = g.Skips[k]
+		if id, err = r.DB.LogID(g.Skips[k]); err != nil {
+			return object.Zero, err
+		}
 		if g, err = r.Graph(id); err != nil {
 			return object.Zero, err
 		}

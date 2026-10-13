@@ -226,10 +226,9 @@ func (s *Server) info(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	hits, misses, bytes := s.Repo.DB.HotStats()
-	return map[string]any{"tier": "server", "changesets": s.Repo.LogSize(), "refs": len(refs),
-		"hot_cache":   map[string]any{"hits": hits, "misses": misses, "bytes": bytes},
-		"cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS()}, nil
+	out := map[string]any{"tier": "server", "changesets": s.Repo.LogSize(), "refs": len(refs),
+		"cpu_seconds": metrics.CPUSeconds(), "max_rss": metrics.MaxRSS(), "store": s.Repo.DB.Stats()}
+	return out, nil
 }
 
 func (s *Server) refs(r *http.Request) (any, error) { return s.Repo.Refs() }
