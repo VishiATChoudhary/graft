@@ -66,6 +66,7 @@ Infrastructure:
   gft serve --tier daemon --upstream <cache> [--listen unix:///run/gft.sock] [--disk 20G] [--seed file]
   gft snapshot --server <url> --rev main --out <file>
   gft import --data <dir> --git <repo> [--ref refs/heads/main]...
+  gft compact --data <dir> [--window 50]   optional: re-delta whole blobs against similar ones (never required)
   gft info [--server url]
 
 Environment: GFT_SERVER (default server for repository queries outside a working copy).
@@ -92,6 +93,8 @@ func main() {
 		err = cmdSnapshot(args)
 	case "import":
 		err = cmdImport(args)
+	case "compact":
+		err = cmdCompact(args)
 	case "clone":
 		err = cmdClone(args)
 	case "mount":
@@ -316,6 +319,43 @@ func cmdImport(args []string) error {
 	}
 	time.Sleep(200 * time.Millisecond) // obsolete files are deleted asynchronously
 	return db2.Close()
+}
+
+func cmdCompact(args []string) error {
+	fs := flag.NewFlagSet("compact", flag.ExitOnError)
+	data := fs.String("data", "", "server data directory")
+	window := fs.Int("window", 50, "candidates tried per whole blob")
+	parse(fs, args)
+	if *data == "" {
+		return errors.New("--data is required")
+	}
+	db, err := store.OpenDB(*data, 1<<30)
+	if err != nil {
+		return err
+	}
+	r, err := repo.Open(db)
+	if err != nil {
+		db.Close()
+		return err
+	}
+	start := time.Now()
+	st, err := r.Compact(*window, func(done, total int) {
+		fmt.Fprintf(os.Stderr, "\r%d/%d blobs", done, total)
+	})
+	fmt.Fprintln(os.Stderr)
+	if cerr := db.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if db2, err := store.OpenDB(*data, 64<<20); err == nil { // drop obsolete files
+		time.Sleep(200 * time.Millisecond)
+		db2.Close()
+	}
+	fmt.Printf("compacted %d blobs (%d whole, %d improved): %.1f MB -> %.1f MB in %s\n", st.Blobs, st.Full, st.Improved,
+		float64(st.Before)/1e6, float64(st.After)/1e6, time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
 func cmdClone(args []string) error {

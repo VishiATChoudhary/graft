@@ -121,9 +121,9 @@ gft status && gft commit -m "docs" && gft land   # only the overlay is uploaded
 gft checkout main~100            # instant: the mount switches revision in place
 ```
 
-`gft mount` exports a loopback NFSv3 server. On macOS this needs no kernel
-extension or root. On Linux, mounting NFS needs root (`--no-mount` prints the
-command).
+`gft mount` needs no root anywhere: NFS on macOS (no kernel extension), FUSE
+on Linux, WebDAV on Windows (`net use`). Pick a backend with
+`--backend nfs|fuse|webdav`.
 
 Ask questions without any checkout:
 
@@ -150,10 +150,20 @@ gft serve --tier server --store $NODES --listen :7070                           
 gft import --store $NODES --git ~/src/myrepo
 ```
 
-Objects and derived data are placed by ID. Refs and the changeset log live
-on shard 0, where ref compare-and-swap is atomic. API servers are caches that
-compute derived data and write it back, so they hold no state of their own.
-Delta bases are resolved across shards, so storage stays dense. On a single
+Each shard can be a replica set: list replicas with `|`. Data is written to
+a majority of a shard's replicas and read with failover. Shard 0's replicas
+run Raft for refs and the changeset log, so losing the leader triggers an
+election and clients carry on:
+
+```sh
+NODES='http://a0:7600|http://a1:7600|http://a2:7600,http://b0:7600|http://b1:7600|http://b2:7600'
+gft serve --tier store --data /data --nodes "$NODES" --shard 0 --replica 1 \
+    --raft-addr a1:7700 --raft-peers a0:7700,a1:7700,a2:7700 --listen :7600
+```
+
+API servers are caches that compute derived data and write it back, so they
+hold no state of their own. Delta bases are resolved across shards, so
+storage stays dense. On a single
 machine, three API servers over three shards land 139 lands/s versus 200 for
 one server: the extra hops cost latency, and the point of the fleet is
 spreading load across machines.
@@ -208,8 +218,8 @@ Everything the CLI does is an API call to the server (`internal/api`):
 
 Version 0.1, tested with `go test -race ./...`, the repository suite against
 a 3-shard fleet, and `bench/smoke.sh`, which imports a real repository and
-cross-checks it against git. Code review here means approval gates; there is
-no review UI. Windows is not supported.
+cross-checks it against git. CI runs on Linux, macOS and Windows. Code
+review here means approval gates; there is no review UI.
 
 ## License
 

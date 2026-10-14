@@ -82,6 +82,7 @@ const (
 var (
 	plainEnc, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
 	bigEnc, _   = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression), zstd.WithEncoderConcurrency(1))
+	bestEnc, _  = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression), zstd.WithEncoderConcurrency(1))
 	plainDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)))
 )
 
@@ -960,3 +961,96 @@ func (d *DB) localBase(id object.ID, withChain bool) (*BaseInfo, error) {
 }
 
 var _ Backend = (*DB)(nil)
+
+// StorageInfo reports how an object is stored (codec) and its record size.
+func (d *DB) StorageInfo(id object.ID) (byte, int, error) {
+	b, err := d.raw(id)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(b) < 2 {
+		return 0, len(b), object.ErrCorrupt
+	}
+	return b[1], len(b), nil
+}
+
+// Redictionary trains a new dictionary for kind from the given objects (the
+// whole ones among them, up to a sample) and re-encodes every whole object
+// in ids with it when that is smaller. Used by optional compaction, so the
+// dictionary reflects current content rather than the oldest history.
+func (d *DB) Redictionary(kind object.Kind, ids []object.ID) (improved int, err error) {
+	ds := d.dicts[kind]
+	if ds == nil {
+		return 0, nil
+	}
+	var sample [][]byte
+	step := max(1, len(ids)/4000)
+	for i := 0; i < len(ids); i += step {
+		b, err := d.raw(ids[i])
+		if err != nil || len(b) < 2 || b[1] > codecDict {
+			continue
+		}
+		k, p, err := d.Payload(ids[i])
+		if err != nil || k != kind || len(p) < 32 || len(p) > ds.maxLen {
+			continue
+		}
+		sample = append(sample, p)
+	}
+	if len(sample) < 100 {
+		return 0, nil
+	}
+	hist := bytes.Join(sample, nil)
+	if len(hist) > ds.history {
+		hist = hist[len(hist)-ds.history:]
+	}
+	ds.mu.RLock()
+	no := max(ds.no, ds.base) + 1
+	ds.mu.RUnlock()
+	dict, err := zstd.BuildDict(zstd.BuildDictOptions{ID: no, Contents: sample, History: hist, Offsets: [3]int{1, 4, 8}})
+	if err != nil {
+		return 0, err
+	}
+	// Compaction is offline, so it can afford zstd's strongest level.
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderDict(dict), zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	if err != nil {
+		return 0, err
+	}
+	if err := d.db.Set(key(pfxMeta, []byte("dict/"+strconv.Itoa(int(no)))), dict, pebble.Sync); err != nil {
+		return 0, err
+	}
+	if err := d.installDict(no, dict); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		b, err := d.raw(id)
+		if err != nil || len(b) < 2 || b[1] > codecDict {
+			continue
+		}
+		k, p, err := d.Payload(id)
+		if err != nil || k != kind {
+			continue
+		}
+		if len(p) > 1<<20 { // too large for a dictionary: strongest plain zstd
+			if out := append([]byte{byte(kind), 1}, bestEnc.EncodeAll(p, nil)...); len(out) < len(b) {
+				if err := d.write(id, out); err != nil {
+					return improved, err
+				}
+				improved++
+			}
+			continue
+		}
+		var e object.Encoder
+		e.Byte(byte(kind))
+		e.Byte(codecDict)
+		e.Uvarint(uint64(no))
+		e.Uvarint(uint64(len(p)))
+		out := enc.EncodeAll(p, e.B)
+		if len(out) < len(b) {
+			if err := d.write(id, out); err != nil {
+				return improved, err
+			}
+			improved++
+		}
+	}
+	return improved, nil
+}

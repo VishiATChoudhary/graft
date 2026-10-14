@@ -148,18 +148,32 @@ testing.
   file-per-object. A client without a daemon caches trees only, since blobs
   are already in its working copy.
 
-## Horizontal scaling (`store.Sharded`, `store.NodeHandler`)
+## Horizontal scaling and replication (`store.Sharded`, `store.NodeHandler`, `store.MetaGroup`)
 
-`gft serve --tier store` runs one storage shard. Objects and derived data are
-placed by ID prefix; refs and the changeset log live on shard 0, which
-performs ref compare-and-swap and assigns log sequence numbers atomically.
+`gft serve --tier store` runs one replica of one storage shard. Objects and
+derived data are placed on shards by ID prefix, and each shard is a replica
+set (`--nodes a|b|c,d|e|f`):
+
+* immutable writes (objects, derived data) go to every replica of the shard
+  and succeed once a majority acknowledges them (they are idempotent);
+* reads go to one replica and fail over to the others; a replica that missed
+  a write is repaired when another replica serves the data; data is reported
+  absent only when a majority says so (any majority intersects every write
+  majority);
+* the only mutable state, refs and the changeset log, lives on shard 0,
+  whose replicas form a Raft group (hashicorp/raft). Ref compare-and-swap
+  and log appends are Raft commands, committed on a majority and applied in
+  the same order on every replica; reads of current refs go through the
+  leader after confirming leadership; followers answer with a redirect to
+  the leader. Clients follow redirects and retry through elections.
+
 `gft serve --tier server --store ...` runs a stateless API server over the
 fleet. It caches everything immutable and computes derived data, writing the
-results back, so any number can run. When a delta base lives on another
-shard, the storing shard fetches it from its peer, so storage stays dense
-across shards. The repository test suite runs against a 3-shard fleet in CI,
-and a test lands concurrently through three API servers and checks nothing
-is lost.
+results back, so any number can run. A shard resolves delta bases held by
+other shards from any of their replicas. Tests run the repository suite
+against a 3-shard fleet, land concurrently through three API servers, and
+kill the Raft leader and a data replica mid-workload (two shards x three
+replicas) checking that landing continues and nothing is lost.
 
 ## Diff, merge and blame (`internal/diff`)
 
@@ -181,7 +195,10 @@ renames are followed. Server-side merges use diff3.
   on macOS and inotify on Linux, synchronized with cookie files like git's
   fsmonitor. Status then examines only what changed. The index token only
   advances when the index provably reflects every earlier change.
-* **Virtual checkout**: `gft mount` serves a revision over loopback NFSv3.
+* **Virtual checkout**: `gft mount` serves a revision through NFSv3 (macOS
+  default, no kernel extension), FUSE (Linux default; fusermount is setuid
+  so no root is needed) or WebDAV (Windows default, mounted with `net use`
+  as a normal user).
   Unmodified files are fetched on first read; writes go to a copy-on-write
   overlay with whiteouts for deletions. Inside the mount, `gft status`,
   `commit`, `land` and `checkout` talk to the mount's control socket: commit
@@ -197,19 +214,15 @@ renames are followed. Server-side merges use diff3.
 
 ## Where graft differs from the post
 
-* **Storage backend.** The fleet stores data in pebble shards, not Spanner,
-  and shard 0 holds refs and the log rather than a replicated, globally
-  consistent database. Replication and failover of storage nodes are out of
-  scope.
+* **Storage backend.** Shards are pebble stores replicated by graft itself
+  (majority writes, Raft for refs and the log), not Spanner. There is no
+  automatic re-replication to new machines or cross-region placement.
 * **Code review** is a set of approval gates with semantic exemptions and an
   API, not a review UI like Antique. **Code search** is an unindexed parallel
   scan.
-* **Virtual checkout** uses loopback NFS rather than a kernel filesystem
-  driver: it needs no extension on macOS, but Linux requires root to mount.
-* **Storage efficiency** is decided entirely at write time, with no
-  repacking. graft is smaller than git's repack on every repository tested,
-  and smaller than `gc --aggressive` on two of three; on redis/redis the
-  offline aggressive repack is 4% smaller.
+* **Storage efficiency** is decided at write time; nothing ever needs
+  repacking. `gft compact` is an optional pass (like `git gc --aggressive`)
+  that re-deltas blobs against similar ones anywhere in history.
 
 ## Code map
 

@@ -381,3 +381,69 @@ func TestGrep(t *testing.T) {
 		}
 	}
 }
+
+// TestCompactPreservesContent compacts a store and checks every blob and
+// tree still reads back byte-identical (verified against its ID).
+func TestCompactPreservesContent(t *testing.T) {
+	r := newRepo(t)
+	if _, ok := r.DB.(*store.DB); !ok {
+		t.Skip("compaction runs on a local store")
+	}
+	var parent []object.ID
+	for i := 0; i < 300; i++ {
+		files := map[string]string{
+			fmt.Sprintf("d%d/main.go", i%5):  strings.Repeat(fmt.Sprintf("line %d of version %d\n", i%7, i), 40+i%9),
+			fmt.Sprintf("e%d/main.go", i%3):  strings.Repeat("shared content block\n", 30) + fmt.Sprint(i),
+			fmt.Sprintf("big/file%d.txt", i): strings.Repeat(fmt.Sprint(i%11, " lorem ipsum dolor sit amet\n"), 200),
+		}
+		parent = []object.ID{commit(t, r, parent, fmt.Sprint(i), files)}
+	}
+	st, err := r.Compact(50, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.After > st.Before {
+		t.Fatalf("compaction grew storage: %d -> %d", st.Before, st.After)
+	}
+	r2, _ := Open(r.DB)
+	ids, err := r2.Log(parent[0], 0, false)
+	if err != nil || len(ids) != 300 {
+		t.Fatalf("log after compaction: %d %v", len(ids), err)
+	}
+	for _, id := range ids {
+		root, _ := r2.RootTree(id)
+		var walk func(tid object.ID)
+		walk = func(tid object.ID) {
+			b, err := r2.DB.Get(tid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := object.Verify(tid, b); err != nil {
+				t.Fatal(err)
+			}
+			tr, _ := object.DecodeTree(mustPayload(t, b))
+			for _, e := range tr.Entries {
+				if e.Mode == object.ModeDir {
+					walk(e.ID)
+					continue
+				}
+				bb, err := r2.DB.Get(e.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := object.Verify(e.ID, bb); err != nil {
+					t.Fatalf("blob %s corrupt after compaction: %v", e.ID.Short(), err)
+				}
+			}
+		}
+		walk(root)
+	}
+}
+
+func mustPayload(t *testing.T, b []byte) []byte {
+	_, p, err := object.Unpack(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

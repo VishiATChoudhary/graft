@@ -47,6 +47,9 @@ type Sharded struct {
 	dbytes   int64
 	seqs     sync.Map // ID -> seq
 	ids      sync.Map // seq -> ID
+
+	hints     chan [2]object.ID // asynchronous Deltify hints
+	hintsOnce sync.Once
 }
 
 // ShardOf returns the shard index for an ID (by its storage prefix).
@@ -341,10 +344,24 @@ func (s *Sharded) PutBase(id object.ID, stored []byte, base object.ID) error {
 	return nil
 }
 
-// Deltify is a storage hint: best effort on every replica.
+// Deltify is a storage hint: it is queued and sent to every replica in the
+// background (dropped if the queue is full), keeping it off the write path.
 func (s *Sharded) Deltify(id, base object.ID) error {
-	for _, u := range s.replicas(id) {
-		s.call("POST", u+"/kv/deltify", append(id[:len(id):len(id)], base[:]...))
+	s.hintsOnce.Do(func() {
+		s.hints = make(chan [2]object.ID, 4096)
+		for i := 0; i < 4; i++ {
+			go func() {
+				for h := range s.hints {
+					for _, u := range s.replicas(h[0]) {
+						s.call("POST", u+"/kv/deltify", append(h[0][:len(h[0]):len(h[0])], h[1][:]...))
+					}
+				}
+			}()
+		}
+	})
+	select {
+	case s.hints <- [2]object.ID{id, base}:
+	default:
 	}
 	return nil
 }
