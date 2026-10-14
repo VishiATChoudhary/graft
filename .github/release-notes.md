@@ -1,6 +1,14 @@
 graft, an open-source implementation of the source control design in
 Anthropic's "Redesigning source control" post.
 
+Since v0.1.1:
+
+* Tested against real Cloud Spanner: the whole repository suite passes.
+  New versions are stored there as compressed deltas.
+* Fleet benchmark across machines (README): reads 1.9x and lands over many
+  refs 1.4x a single server.
+* `gft loadgen --read` and `--refs N`.
+
 Since v0.1.0:
 
 * Change requests, a merge queue that lands approved requests, and a review
