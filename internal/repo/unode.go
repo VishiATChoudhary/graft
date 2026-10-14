@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -170,6 +171,19 @@ func (r *Repo) loadBatch(link uint64) (map[string]storedEntry, error) {
 		return v.(map[string]storedEntry), nil
 	}
 	raw, err := r.DB.GetDerived("ub", batchKey(link))
+	if errors.Is(err, object.ErrNotFound) {
+		// Derived data is always derivable: a batch is written as part of
+		// computing its changeset's record, so recompute that (for
+		// instance if the write that stored the batch was lost).
+		id, lerr := r.DB.LogID(link)
+		if lerr != nil {
+			return nil, err
+		}
+		if _, derr := r.eng.Recompute(r.cs, id); derr != nil {
+			return nil, derr
+		}
+		raw, err = r.DB.GetDerived("ub", batchKey(link))
+	}
 	if err != nil {
 		return nil, err
 	}

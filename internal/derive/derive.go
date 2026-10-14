@@ -110,6 +110,10 @@ func (e *Engine) Derive(t *Type, id object.ID) ([]byte, error) {
 	return e.derive(t, id)
 }
 
+// Recompute derives t at id again even if a value is cached, rewriting
+// it (values are deterministic). Used to regenerate lost side records.
+func (e *Engine) Recompute(t *Type, id object.ID) ([]byte, error) { return e.derive(t, id) }
+
 // Get returns the value of t at id, deriving it (and any missing ancestor
 // values) if needed. Derivation is iterative so arbitrarily long histories
 // do not overflow the stack.

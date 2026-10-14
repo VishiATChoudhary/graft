@@ -737,6 +737,11 @@ func (d *DB) PutDerived(kind string, id object.ID, v []byte) error {
 	return d.db.Set(key(pfxDerived, []byte(kind), []byte{0}, id[:keyIDLen]), v, pebble.NoSync)
 }
 
+// DeleteDerived removes a derived value (it is recomputed on demand).
+func (d *DB) DeleteDerived(kind string, id object.ID) error {
+	return d.db.Delete(key(pfxDerived, []byte(kind), []byte{0}, id[:keyIDLen]), pebble.NoSync)
+}
+
 // ---------------------------------------------------------------- refs
 
 func (d *DB) GetRef(name string) (object.ID, error) {

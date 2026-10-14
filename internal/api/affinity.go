@@ -23,7 +23,10 @@ import (
 
 const forwardedHeader = "X-Graft-Forwarded"
 
-var peerClient = &http.Client{Timeout: 3 * time.Minute}
+// Many lands are forwarded concurrently: keep enough idle connections that
+// they are reused rather than churned through TIME_WAIT.
+var peerClient = &http.Client{Timeout: 3 * time.Minute, Transport: &http.Transport{
+	MaxIdleConns: 1024, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second}}
 
 // forwardedError carries a peer's error response through unchanged.
 type forwardedError struct {

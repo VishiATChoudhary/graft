@@ -54,8 +54,11 @@ type Sharded struct {
 	// Write-behind for objects: PutBase returns once the write is queued;
 	// barrier() waits for every queued write before anything that can
 	// reference those objects is published (log, derived data, refs).
-	queued        sync.Map     // ID -> stored bytes, until written
-	byID          sync.Map     // ID -> *pendingWrite
+	queued        sync.Map // ID -> stored bytes, until written
+	byID          sync.Map // ID -> *pendingWrite
+	dmuQ          sync.Mutex
+	dq            []derivedItem
+	dwriting      bool
 	queuedDerived sync.Map     // derivedKey -> value, until written
 	derivedN      atomic.Int64 // queued derived writes (Flush waits)
 	waiting       map[uint64]chan struct{}
@@ -496,32 +499,83 @@ func (s *Sharded) cacheDerived(kind string, id object.ID, v []byte) {
 	s.dbytes += int64(len(v)) + 64
 }
 
-// PutDerived is write-behind: the value is readable here at once and is
-// written after every object queued before it (so derived data never
-// refers to objects not yet durable). Derived data is a cache, so
-// publishing (log appends, ref updates) does not wait for it; Flush does.
+// PutDerived is write-behind: the value is readable here at once. One
+// writer drains the queue in batches (one request per shard and kind), so
+// this server's derived writes become durable in the order they were made:
+// a record never becomes visible before records it refers to (a changeset
+// record before its history batch). Each batch is written after every
+// object write queued before it. Derived data is a cache, so publishing
+// (log appends, ref updates) does not wait for it; Flush does.
 func (s *Sharded) PutDerived(kind string, id object.ID, v []byte) error {
 	s.cacheDerived(kind, id, v)
 	k := derivedKey{kind, id}
 	s.queuedDerived.Store(k, v)
-	s.pendMu.Lock()
-	prior := make([]chan struct{}, 0, len(s.waiting))
-	for _, c := range s.waiting {
-		prior = append(prior, c)
-	}
-	s.pendMu.Unlock()
 	s.derivedN.Add(1)
-	go func() {
-		defer s.derivedN.Add(-1)
+	s.dmuQ.Lock()
+	s.dq = append(s.dq, derivedItem{k, v})
+	start := !s.dwriting
+	s.dwriting = true
+	s.dmuQ.Unlock()
+	if start {
+		go s.derivedWriter()
+	}
+	return nil
+}
+
+type derivedItem struct {
+	k derivedKey
+	v []byte
+}
+
+func (s *Sharded) derivedWriter() {
+	for {
+		s.dmuQ.Lock()
+		batch := s.dq
+		s.dq = nil
+		if len(batch) == 0 {
+			s.dwriting = false
+			s.dmuQ.Unlock()
+			return
+		}
+		s.dmuQ.Unlock()
+		// Objects queued before this batch must be durable first.
+		s.pendMu.Lock()
+		prior := make([]chan struct{}, 0, len(s.waiting))
+		for _, c := range s.waiting {
+			prior = append(prior, c)
+		}
+		s.pendMu.Unlock()
 		for _, c := range prior {
 			<-c
 		}
-		s.inflight <- struct{}{}
-		s.writeAll(s.replicas(id), "/kv/derived/put?kind="+kind, derivedFrame(id, v))
-		<-s.inflight
-		s.queuedDerived.Delete(k)
-	}()
-	return nil
+		type group struct {
+			reps []string
+			kind string
+		}
+		groups := map[string]*group{}
+		bodies := map[string][]byte{}
+		for _, it := range batch {
+			reps := s.replicas(it.k.id)
+			gk := it.k.kind + "\x00" + strings.Join(reps, "|")
+			if groups[gk] == nil {
+				groups[gk] = &group{reps, it.k.kind}
+			}
+			bodies[gk] = append(bodies[gk], derivedFrame(it.k.id, it.v)...)
+		}
+		var wg sync.WaitGroup
+		for gk, g := range groups {
+			wg.Add(1)
+			go func(g *group, body []byte) {
+				defer wg.Done()
+				s.writeAll(g.reps, "/kv/derived/put?kind="+g.kind, body)
+			}(g, bodies[gk])
+		}
+		wg.Wait()
+		for _, it := range batch {
+			s.queuedDerived.Delete(it.k)
+		}
+		s.derivedN.Add(-int64(len(batch)))
+	}
 }
 
 func (s *Sharded) GetRef(name string) (object.ID, error) {
