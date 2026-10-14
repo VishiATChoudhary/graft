@@ -50,6 +50,16 @@ type Sharded struct {
 
 	hints     chan [2]object.ID // asynchronous Deltify hints
 	hintsOnce sync.Once
+
+	// Write-behind for objects: PutBase returns once the write is queued;
+	// barrier() waits for every queued write before anything that can
+	// reference those objects is published (log, derived data, refs).
+	queued   sync.Map // ID -> stored bytes, until written
+	waiting  map[uint64]chan struct{}
+	ticket   uint64
+	pendMu   sync.Mutex
+	pendErr  error
+	inflight chan struct{}
 }
 
 // ShardOf returns the shard index for an ID (by its storage prefix).
@@ -89,7 +99,7 @@ func NewSharded(nodes []string, cacheBytes int64) *Sharded {
 		cacheBytes = 1 << 30
 	}
 	s := &Sharded{shards: ParseFleet(nodes), client: &http.Client{Transport: tr, Timeout: 5 * time.Minute},
-		hot: NewMemLRU(cacheBytes / 2), payloads: NewMemLRU(cacheBytes / 2)}
+		hot: NewMemLRU(cacheBytes / 2), payloads: NewMemLRU(cacheBytes / 2), inflight: make(chan struct{}, 64), waiting: map[uint64]chan struct{}{}}
 	s.leader.Store("")
 	return s
 }
@@ -287,6 +297,9 @@ func (s *Sharded) Get(id object.ID) ([]byte, error) {
 	if b, err := s.hot.Get(id); err == nil {
 		return b, nil
 	}
+	if v, ok := s.queued.Load(id); ok {
+		return v.([]byte), nil
+	}
 	body, err := s.readAny(s.replicas(id), "/kv/get", id[:], func(b []byte) bool { return oneFrame(b) != nil }, s.repairObject(id))
 	if err != nil {
 		return nil, err
@@ -300,6 +313,17 @@ func (s *Sharded) Payload(id object.ID) (object.Kind, []byte, error) {
 	if v, err := s.payloads.Get(id); err == nil {
 		return object.Kind(v[0]), v[1:], nil
 	}
+	// Objects this server holds (written recently or cached) unpack locally.
+	if b, err := s.hot.Get(id); err == nil {
+		if k, p, err := object.Unpack(b); err == nil {
+			return k, p, nil
+		}
+	}
+	if v, ok := s.queued.Load(id); ok {
+		if k, p, err := object.Unpack(v.([]byte)); err == nil {
+			return k, p, nil
+		}
+	}
 	body, err := s.readAny(s.replicas(id), "/kv/payload", id[:], func(b []byte) bool { return len(oneFrame(b)) > 0 }, nil)
 	if err != nil {
 		return 0, nil, err
@@ -311,6 +335,9 @@ func (s *Sharded) Payload(id object.ID) (object.Kind, []byte, error) {
 
 func (s *Sharded) Has(id object.ID) (bool, error) {
 	if ok, _ := s.hot.Has(id); ok {
+		return true, nil
+	}
+	if _, ok := s.queued.Load(id); ok {
 		return true, nil
 	}
 	if ok, _ := s.payloads.Has(id); ok {
@@ -337,11 +364,47 @@ func (s *Sharded) PayloadSize(id object.ID) (uint64, error) {
 func (s *Sharded) Put(id object.ID, stored []byte) error { return s.PutBase(id, stored, object.Zero) }
 
 func (s *Sharded) PutBase(id object.ID, stored []byte, base object.ID) error {
-	if err := s.writeAll(s.replicas(id), "/kv/put", putFrame(id, base, stored)); err != nil {
-		return err
-	}
-	s.hot.Put(id, stored)
+	s.hot.Put(id, stored) // readable by this server immediately
+	s.queued.Store(id, stored)
+	done := make(chan struct{})
+	s.pendMu.Lock()
+	s.ticket++
+	t := s.ticket
+	s.waiting[t] = done
+	s.pendMu.Unlock()
+	s.inflight <- struct{}{}
+	go func() {
+		err := s.writeAll(s.replicas(id), "/kv/put", putFrame(id, base, stored))
+		s.queued.Delete(id)
+		<-s.inflight
+		s.pendMu.Lock()
+		if err != nil && s.pendErr == nil {
+			s.pendErr = err
+		}
+		delete(s.waiting, t)
+		s.pendMu.Unlock()
+		close(done)
+	}()
 	return nil
+}
+
+// barrier waits for every object write queued before it (by any
+// goroutine) and reports the first failure.
+func (s *Sharded) barrier() error {
+	s.pendMu.Lock()
+	chans := make([]chan struct{}, 0, len(s.waiting))
+	for _, c := range s.waiting {
+		chans = append(chans, c)
+	}
+	s.pendMu.Unlock()
+	for _, c := range chans {
+		<-c
+	}
+	s.pendMu.Lock()
+	defer s.pendMu.Unlock()
+	err := s.pendErr
+	s.pendErr = nil
+	return err
 }
 
 // Deltify is a storage hint: it is queued and sent to every replica in the
@@ -403,6 +466,9 @@ func (s *Sharded) cacheDerived(kind string, id object.ID, v []byte) {
 }
 
 func (s *Sharded) PutDerived(kind string, id object.ID, v []byte) error {
+	if err := s.barrier(); err != nil {
+		return err
+	}
 	if err := s.writeAll(s.replicas(id), "/kv/derived/put?kind="+kind, derivedFrame(id, v)); err != nil {
 		return err
 	}
@@ -421,6 +487,9 @@ func (s *Sharded) GetRef(name string) (object.ID, error) {
 }
 
 func (s *Sharded) CASRef(name string, old, new object.ID) error {
+	if err := s.barrier(); err != nil {
+		return err
+	}
 	b, _ := json.Marshal(struct {
 		Name     string
 		Old, New object.ID
@@ -447,6 +516,9 @@ func (s *Sharded) ListRefs() (map[string]object.ID, error) {
 }
 
 func (s *Sharded) AppendLog(id object.ID) (uint64, error) {
+	if err := s.barrier(); err != nil {
+		return 0, err
+	}
 	body, _, err := s.meta("POST", "/kv/log/append", id[:])
 	if err != nil {
 		return 0, err
@@ -546,6 +618,9 @@ func (s *Sharded) Stats() map[string]any {
 }
 
 func (s *Sharded) Flush() error {
+	if err := s.barrier(); err != nil {
+		return err
+	}
 	for _, reps := range s.shards {
 		for _, u := range reps {
 			s.call("POST", u+"/kv/flush", nil)
