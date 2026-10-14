@@ -575,7 +575,8 @@ type dictState struct {
 	sample          [][]byte
 	sampleIDs       []object.ID
 	trainingStarted bool
-	late            []object.ID // written plain while training; re-encoded after
+	trained         chan struct{} // closed when training ends (inline mode waits)
+	late            []object.ID   // written plain while training; re-encoded after
 	failed          atomic.Bool
 }
 
@@ -591,6 +592,15 @@ func (ds *dictState) encoder(d *DB, id object.ID, p []byte) (*zstd.Encoder, uint
 	if ds.failed.Load() {
 		ds.mu.Unlock()
 		return nil, 0
+	}
+	if ds.trainingStarted && d.TrainInline && ds.trained != nil {
+		// Bulk writers wait for the dictionary (densest result).
+		done := ds.trained
+		ds.mu.Unlock()
+		<-done
+		ds.mu.RLock()
+		defer ds.mu.RUnlock()
+		return ds.enc, ds.no
 	}
 	if ds.trainingStarted {
 		// Training runs in the background; this object is stored plain
@@ -614,8 +624,10 @@ func (ds *dictState) encoder(d *DB, id object.ID, p []byte) (*zstd.Encoder, uint
 	ds.trainingStarted = true
 	sample, ids := ds.sample, ds.sampleIDs
 	if d.TrainInline {
+		ds.trained = make(chan struct{})
 		ds.mu.Unlock()
 		d.train(ds, sample, ids)
+		close(ds.trained)
 		ds.mu.RLock()
 		defer ds.mu.RUnlock()
 		return ds.enc, ds.no
