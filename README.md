@@ -191,13 +191,21 @@ server while another is in flight are rebased in a chain and published with
 one CAS, each still checked and failing on its own. With `--peers` and
 `--self`, API servers forward a land to the server that owns the ref (by
 hash), so a ref's lands meet in one place; if the owner is down, any server
-lands it and the CAS keeps it correct. Measured with `gft loadgen` (128
-agents, after a warm-up round) on one 10-core machine: one server lands
-about 4,900 to 8,400 per second and three API servers over three shards
-about 2,500 to 4,900. On one machine the fleet does the same serial
-per-ref work plus serialization and loopback hops, so it does not beat an
-in-process server there; it exists to spread load over machines and to
-survive the loss of any of them.
+lands it and the CAS keeps it correct. Measured on Google Cloud (us-west1, e2-standard-4 VMs with 4 vCPUs each;
+`gft loadgen` from three load-generator VMs at once, after a warm-up
+round; every land verified), one server on one VM against three API
+servers and three storage shards on six VMs:
+
+| workload | one server | fleet (3 API + 3 storage VMs) | |
+|---|---:|---:|---|
+| reads (resolve a ref, read a file) | 20,200 reads/s | **38,500 reads/s** | 1.9x |
+| lands spread over 36 refs | 4,600 to 7,400 lands/s | **6,600 to 10,500 lands/s** | 1.4x |
+| lands on one ref | 1,130 to 1,480 lands/s | 880 to 1,230 lands/s | 0.8x |
+
+Lands on a single ref go through one compare-and-swap in order, wherever
+they run, so spreading them over machines only adds network hops; the
+fleet adds capacity for reads and for many refs. On one laptop the fleet's
+processes share the same cores and it is slower on every workload.
 
 ## Access control and review
 

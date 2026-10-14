@@ -8,6 +8,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1136,21 +1138,44 @@ func cmdRefs(args []string) error {
 	return nil
 }
 
-// cmdLoadgen drives concurrent write+land requests from one process, to
-// measure server capacity without per-request process startup.
+// cmdLoadgen drives load from one process, to measure server capacity
+// without per-request process startup: concurrent write+land requests
+// (optionally spread over several refs), or reads (--read: resolve a ref,
+// then read a file).
 func cmdLoadgen(args []string) error {
 	fs := flag.NewFlagSet("loadgen", flag.ExitOnError)
 	servers := fs.String("servers", "", "comma-separated API servers (agents spread round-robin)")
 	agents := fs.Int("agents", 64, "concurrent agents")
-	per := fs.Int("per", 8, "lands per agent")
-	ref := fs.String("ref", "main", "ref to land on")
+	per := fs.Int("per", 8, "operations per agent")
+	ref := fs.String("ref", "main", "ref to land on (with --refs N: <ref>-0 .. <ref>-N-1)")
+	refs := fs.Int("refs", 1, "number of refs the agents land on")
 	prefix := fs.String("prefix", "agents", "directory for the agents' files")
+	read := fs.Bool("read", false, "read instead of landing: resolve the ref, then read one of <prefix>/<dir>/<file>.txt")
+	dirs := fs.Int("dirs", 256, "with --read: directories under --prefix")
+	files := fs.Int("files", 24, "with --read: files per directory")
 	parse(fs, args)
 	urls := strings.Split(*servers, ",")
 	c0, _ := apiClient(urls[len(urls)-1])
-	before, err := c0.Resolve(bg(), *ref)
-	if err != nil {
-		return err
+	refOf := func(a int) string {
+		if *refs <= 1 {
+			return *ref
+		}
+		return fmt.Sprintf("%s-%d", *ref, a%*refs)
+	}
+	before := map[string]uint64{}
+	for i := 0; i < max(1, *refs) && !*read; i++ {
+		name := refOf(i)
+		info, err := c0.Resolve(bg(), name)
+		if err != nil { // create the ref with a first changeset
+			if _, err := c0.Write(bg(), &api.WriteRequest{Author: "loadgen", Message: "start " + name, Land: name,
+				Files: []api.WriteFile{{Path: "README", Content: []byte(name + "\n")}}}); err != nil {
+				return err
+			}
+			if info, err = c0.Resolve(bg(), name); err != nil {
+				return err
+			}
+		}
+		before[name] = info.Depth
 	}
 	var wg sync.WaitGroup
 	errs := make(chan error, *agents)
@@ -1160,10 +1185,21 @@ func cmdLoadgen(args []string) error {
 		go func(a int) {
 			defer wg.Done()
 			c, _ := apiClient(urls[a%len(urls)])
+			rng := rand.New(rand.NewSource(int64(a)))
 			for k := 0; k < *per; k++ {
-				req := &api.WriteRequest{Parent: *ref, Author: "loadgen", Message: fmt.Sprintf("agent %d change %d", a, k), Land: *ref,
-					Files: []api.WriteFile{{Path: fmt.Sprintf("%s/%d/%d.txt", *prefix, a, k), Content: []byte(fmt.Sprintf("change %d\n", k))}}}
-				if _, err := c.Write(bg(), req); err != nil {
+				var err error
+				if *read {
+					var info *api.ChangesetInfo
+					if info, err = c.Resolve(bg(), *ref); err == nil {
+						p := fmt.Sprintf("%s/%d/%d.txt", *prefix, rng.Intn(*dirs), rng.Intn(*files))
+						err = c.Cat(bg(), io.Discard, info.ID.String(), p)
+					}
+				} else {
+					r := refOf(a)
+					_, err = c.Write(bg(), &api.WriteRequest{Parent: r, Author: "loadgen", Message: fmt.Sprintf("agent %d change %d", a, k), Land: r,
+						Files: []api.WriteFile{{Path: fmt.Sprintf("%s/%d/%d.txt", *prefix, a, k), Content: []byte(fmt.Sprintf("change %d\n", k))}}})
+				}
+				if err != nil {
 					errs <- err
 					return
 				}
@@ -1177,22 +1213,35 @@ func cmdLoadgen(args []string) error {
 		return err
 	}
 	n := *agents * *per
-	// Verify: history grew by exactly one changeset per land, linearly,
-	// and every agent's files are present (read through another server).
-	after, err := c0.Resolve(bg(), *ref)
-	if err != nil {
-		return err
+	if *read {
+		fmt.Printf("%d reads (resolve + file) in %s: %.1f reads/s\n", n, wall.Round(time.Millisecond), float64(n)/wall.Seconds())
+		return nil
 	}
-	if after.Depth != before.Depth+uint64(n) {
-		return fmt.Errorf("verify: history depth %d, want %d", after.Depth, before.Depth+uint64(n))
+	// Verify: each ref's history grew by exactly one changeset per land,
+	// linearly, and every agent's files are present on its ref (read
+	// through another server).
+	landed := map[string]uint64{}
+	for a := 0; a < *agents; a++ {
+		landed[refOf(a)] += uint64(*per)
+	}
+	tips := map[string]object.ID{}
+	for name, d0 := range before {
+		info, err := c0.Resolve(bg(), name)
+		if err != nil {
+			return err
+		}
+		if info.Depth != d0+landed[name] {
+			return fmt.Errorf("verify: %s history depth %d, want %d", name, info.Depth, d0+landed[name])
+		}
+		tips[name] = info.ID
 	}
 	for a := 0; a < *agents; a++ {
-		ents, err := c0.Ls(bg(), after.ID.String(), fmt.Sprintf("%s/%d", *prefix, a))
+		ents, err := c0.Ls(bg(), tips[refOf(a)].String(), fmt.Sprintf("%s/%d", *prefix, a))
 		if err != nil || len(ents) != *per {
 			return fmt.Errorf("verify: agent %d has %d files (%v), want %d", a, len(ents), err, *per)
 		}
 	}
-	fmt.Printf("%d lands in %s: %.1f lands/s (verified)\n", n, wall.Round(time.Millisecond), float64(n)/wall.Seconds())
+	fmt.Printf("%d lands on %d ref(s) in %s: %.1f lands/s (verified)\n", n, len(before), wall.Round(time.Millisecond), float64(n)/wall.Seconds())
 	return nil
 }
 
