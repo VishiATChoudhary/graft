@@ -14,6 +14,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VishiATChoudhary/graft/internal/api"
@@ -95,6 +96,8 @@ func main() {
 		err = cmdImport(args)
 	case "compact":
 		err = cmdCompact(args)
+	case "loadgen":
+		err = cmdLoadgen(args)
 	case "clone":
 		err = cmdClone(args)
 	case "mount":
@@ -293,6 +296,7 @@ func cmdImport(args []string) error {
 	if err != nil {
 		return err
 	}
+	db.TrainInline = true // bulk writer: densest dictionaries
 	r, err := repo.Open(db)
 	if err != nil {
 		return err
@@ -333,6 +337,7 @@ func cmdCompact(args []string) error {
 	if err != nil {
 		return err
 	}
+	db.TrainInline = true // bulk writer: densest dictionaries
 	r, err := repo.Open(db)
 	if err != nil {
 		db.Close()
@@ -1045,6 +1050,45 @@ func cmdRefs(args []string) error {
 	for name, id := range refs {
 		fmt.Printf("%s %s\n", id, name)
 	}
+	return nil
+}
+
+// cmdLoadgen drives concurrent write+land requests from one process, to
+// measure server capacity without per-request process startup.
+func cmdLoadgen(args []string) error {
+	fs := flag.NewFlagSet("loadgen", flag.ExitOnError)
+	servers := fs.String("servers", "", "comma-separated API servers (agents spread round-robin)")
+	agents := fs.Int("agents", 64, "concurrent agents")
+	per := fs.Int("per", 8, "lands per agent")
+	ref := fs.String("ref", "main", "ref to land on")
+	parse(fs, args)
+	urls := strings.Split(*servers, ",")
+	var wg sync.WaitGroup
+	errs := make(chan error, *agents)
+	start := time.Now()
+	for a := 0; a < *agents; a++ {
+		wg.Add(1)
+		go func(a int) {
+			defer wg.Done()
+			c, _ := apiClient(urls[a%len(urls)])
+			for k := 0; k < *per; k++ {
+				req := &api.WriteRequest{Parent: *ref, Author: "loadgen", Message: fmt.Sprintf("agent %d change %d", a, k), Land: *ref,
+					Files: []api.WriteFile{{Path: fmt.Sprintf("agents/%d/%d.txt", a, k), Content: []byte(fmt.Sprintf("change %d\n", k))}}}
+				if _, err := c.Write(bg(), req); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(a)
+	}
+	wg.Wait()
+	wall := time.Since(start)
+	close(errs)
+	for err := range errs {
+		return err
+	}
+	n := *agents * *per
+	fmt.Printf("%d lands in %s: %.1f lands/s\n", n, wall.Round(time.Millisecond), float64(n)/wall.Seconds())
 	return nil
 }
 

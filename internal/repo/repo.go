@@ -29,6 +29,8 @@ type Repo struct {
 	// subtrees).
 	OnCreate func(id object.ID)
 
+	landers sync.Map // ref -> *lander (coalesced lands)
+
 	cs *derive.Type // changeset -> root tree, history root, commit graph (one record)
 
 	unodes   *store.MemLRU // decoded directory versions

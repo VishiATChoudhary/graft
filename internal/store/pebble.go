@@ -31,9 +31,14 @@ import (
 // Neither changes object IDs or what clients receive; both are internals
 // that can change without touching clients.
 type DB struct {
-	db       *pebble.DB
-	hot      *MemLRU // standard stored form, for serving
-	payloads *MemLRU // [kind]+payload, for server-internal reads
+	bg sync.WaitGroup // background dictionary training
+	// TrainInline trains dictionaries in the writer that collects the last
+	// sample (bulk import: one writer, densest result) instead of in the
+	// background (servers: no writer ever stalls).
+	TrainInline bool
+	db          *pebble.DB
+	hot         *MemLRU // standard stored form, for serving
+	payloads    *MemLRU // [kind]+payload, for server-internal reads
 
 	seqMu    sync.Mutex
 	seq      uint64
@@ -141,7 +146,10 @@ func (quietLogger) Infof(string, ...interface{})      {}
 func (quietLogger) Errorf(f string, a ...interface{}) { fmt.Printf("pebble: "+f+"\n", a...) }
 func (quietLogger) Fatalf(f string, a ...interface{}) { panic(fmt.Sprintf(f, a...)) }
 
-func (d *DB) Close() error { return d.db.Close() }
+func (d *DB) Close() error {
+	d.bg.Wait()
+	return d.db.Close()
+}
 
 func key(pfx byte, rest ...[]byte) []byte {
 	n := 1
@@ -567,7 +575,7 @@ type dictState struct {
 	sample          [][]byte
 	sampleIDs       []object.ID
 	trainingStarted bool
-	trainMu         sync.Mutex // held while training; writers wait on it
+	late            []object.ID // written plain while training; re-encoded after
 	failed          atomic.Bool
 }
 
@@ -585,12 +593,13 @@ func (ds *dictState) encoder(d *DB, id object.ID, p []byte) (*zstd.Encoder, uint
 		return nil, 0
 	}
 	if ds.trainingStarted {
+		// Training runs in the background; this object is stored plain
+		// now and re-encoded with the dictionary once it exists.
+		if len(ds.late) < 1<<16 {
+			ds.late = append(ds.late, id)
+		}
 		ds.mu.Unlock()
-		ds.trainMu.Lock() // wait for the trainer
-		ds.trainMu.Unlock()
-		ds.mu.RLock()
-		defer ds.mu.RUnlock()
-		return ds.enc, ds.no
+		return nil, 0
 	}
 	if len(p) >= 32 && len(p) <= ds.maxLen {
 		ds.sample = append(ds.sample, bytes.Clone(p))
@@ -600,17 +609,25 @@ func (ds *dictState) encoder(d *DB, id object.ID, p []byte) (*zstd.Encoder, uint
 		ds.mu.Unlock()
 		return nil, 0
 	}
-	// This writer trains. trainMu is taken before releasing mu, so every
-	// writer that sees trainingStarted waits for the result.
+	// Enough samples: train in the background so writers never stall on
+	// it (training takes about a second of CPU).
 	ds.trainingStarted = true
-	ds.trainMu.Lock()
 	sample, ids := ds.sample, ds.sampleIDs
+	if d.TrainInline {
+		ds.mu.Unlock()
+		d.train(ds, sample, ids)
+		ds.mu.RLock()
+		defer ds.mu.RUnlock()
+		return ds.enc, ds.no
+	}
+	ds.late = append(ds.late, id) // this object is written plain too
 	ds.mu.Unlock()
-	d.train(ds, sample, ids)
-	ds.trainMu.Unlock()
-	ds.mu.RLock()
-	defer ds.mu.RUnlock()
-	return ds.enc, ds.no
+	d.bg.Add(1)
+	go func() {
+		defer d.bg.Done()
+		d.train(ds, sample, ids)
+	}()
+	return nil, 0
 }
 
 func (d *DB) train(ds *dictState, sample [][]byte, ids []object.ID) {
@@ -641,8 +658,28 @@ func (d *DB) train(ds *dictState, sample [][]byte, ids []object.ID) {
 		}
 	}
 	ds.mu.Lock()
-	ds.sample, ds.sampleIDs = nil, nil
+	late := ds.late
+	ds.sample, ds.sampleIDs, ds.late = nil, nil, nil
 	ds.mu.Unlock()
+	for _, id := range late {
+		d.redense(id)
+	}
+}
+
+// redense re-encodes a whole plain object with the current dictionary
+// when that is smaller (deltas and dictionary records are left alone).
+func (d *DB) redense(id object.ID) {
+	b, err := d.raw(id)
+	if err != nil || len(b) < 2 || b[1] > 1 {
+		return
+	}
+	k, p, err := d.Payload(id)
+	if err != nil {
+		return
+	}
+	if r := d.denseFull(id, object.Pack(k, p)); len(r) > 1 && r[1] == codecDict && len(r) < len(b) {
+		d.write(id, r)
+	}
 }
 
 func (d *DB) installDict(no uint32, dict []byte) error {

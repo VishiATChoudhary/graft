@@ -32,6 +32,8 @@ func cmdServe(args []string) error {
 	tier := fs.String("tier", "server", "server | cache | daemon | store")
 	spannerDB := fs.String("spanner", "", "server: Cloud Spanner database projects/P/instances/I/databases/D (stateless API server)")
 	spannerInit := fs.Bool("spanner-init", false, "server: create graft's tables in the --spanner database first")
+	peers := fs.String("peers", "", "server: every API server's URL, comma-separated, for ref affinity of lands (optional)")
+	self := fs.Int("self", 0, "server: this server's index in --peers")
 	storeNodes := fs.String("store", "", "server: comma-separated storage nodes (stateless API server); omit to use --data")
 	shard := fs.Int("shard", 0, "store: this node's shard index in --nodes")
 	replica := fs.Int("replica", 0, "store: this node's replica index within its shard")
@@ -86,7 +88,10 @@ func cmdServe(args []string) error {
 		if err != nil {
 			return err
 		}
-		srv := &api.Server{Repo: r, Log: log.Default()}
+		srv := &api.Server{Repo: r, Log: log.Default(), Self: *self}
+		if *peers != "" {
+			srv.Peers = strings.Split(*peers, ",")
+		}
 		if *aclFile != "" {
 			pol, err := acl.Load(*aclFile)
 			if err != nil {

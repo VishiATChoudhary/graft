@@ -34,6 +34,11 @@ type Server struct {
 	// permissions.
 	ACL        *acl.Policy
 	restricted restrictedIndex
+
+	// Peers lists every API server (including this one, at index Self)
+	// for ref affinity of lands; see affinity.go. Optional.
+	Peers []string
+	Self  int
 }
 
 // ChangesetInfo is the JSON form of a changeset with derived context.
@@ -233,6 +238,13 @@ func (s *Server) wrap(h handler) http.HandlerFunc {
 }
 
 func (s *Server) writeErr(w http.ResponseWriter, err error) {
+	var fe *forwardedError
+	if errors.As(err, &fe) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fe.code)
+		w.Write(fe.body)
+		return
+	}
 	code := http.StatusInternalServerError
 	body := ConflictBody{Error: err.Error()}
 	var ce *repo.ConflictError
@@ -436,11 +448,7 @@ func (s *Server) write(r *http.Request) (any, error) {
 	s.recordCreator(r.Context(), id)
 	resp := &WriteResponse{ID: id}
 	if req.Land != "" {
-		tip, _ := s.Repo.Ref(req.Land)
-		if err := s.requireReviews(id, tip); err != nil {
-			return nil, err
-		}
-		if resp.Land, err = s.Repo.Land(req.Land, id, req.Author, cs.Time, 0, s.checkRefMove(r.Context())); err != nil {
+		if resp.Land, err = s.landRouted(r, req.Land, id, req.Author, cs.Time); err != nil {
 			return nil, err
 		}
 	}
@@ -691,11 +699,7 @@ func (s *Server) land(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	tip, _ := s.Repo.Ref(req.Ref)
-	if err := s.requireReviews(id, tip); err != nil {
-		return nil, err
-	}
-	return s.Repo.Land(req.Ref, id, req.Author, time.Now().Unix(), 0, s.checkRefMove(r.Context()))
+	return s.landRouted(r, req.Ref, id, req.Author, time.Now().Unix())
 }
 
 func (s *Server) ls(r *http.Request) (any, error) {

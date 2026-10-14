@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VishiATChoudhary/graft/internal/diff"
@@ -230,73 +231,170 @@ type LandResult struct {
 // lands race on the CAS of a single ref and the loser simply retries.
 // check, if set, may veto moving the ref from old to new (authorization).
 //
+// Lands for the same ref arriving at one server while another is in
+// flight are coalesced: one goroutine rebases each onto the previous
+// result and publishes them all with a single CAS. Each request is still
+// checked and can fail on its own; servers still race only on the CAS.
 // Under contention, losers back off for a random, exponentially growing
-// interval before retrying, so racing lands spread out instead of colliding
-// in lockstep. maxAttempts <= 0 means no attempt limit within landTimeout.
+// interval before retrying. maxAttempts <= 0 means no attempt limit within
+// landTimeout.
 func (r *Repo) Land(ref string, head object.ID, author string, when int64, maxAttempts int, check ...func(old, new object.ID) error) (*LandResult, error) {
-	res := &LandResult{}
+	req := &landReq{head: head, author: author, when: when, max: maxAttempts, check: check, done: make(chan struct{})}
+	v, _ := r.landers.LoadOrStore(ref, &lander{})
+	l := v.(*lander)
+	l.mu.Lock()
+	l.pending = append(l.pending, req)
+	lead := !l.running
+	l.running = true
+	l.mu.Unlock()
+	if lead {
+		r.landLoop(ref, l)
+	}
+	<-req.done
+	return req.res, req.err
+}
+
+type landReq struct {
+	head     object.ID
+	author   string
+	when     int64
+	max      int
+	check    []func(old, new object.ID) error
+	attempts int
+	res      *LandResult
+	err      error
+	done     chan struct{}
+}
+
+type lander struct {
+	mu      sync.Mutex
+	pending []*landReq
+	running bool
+}
+
+func (l *lander) take() []*landReq {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	p := l.pending
+	l.pending = nil
+	return p
+}
+
+// landLoop lands one batch, then hands leadership to a new goroutine if
+// more requests arrived, so the caller returns promptly.
+func (r *Repo) landLoop(ref string, l *lander) {
+	r.landBatch(ref, l, l.take())
+	l.mu.Lock()
+	if len(l.pending) == 0 {
+		l.running = false
+		l.mu.Unlock()
+		return
+	}
+	l.mu.Unlock()
+	go r.landLoop(ref, l)
+}
+
+func (r *Repo) landBatch(ref string, l *lander, batch []*landReq) {
+	finish := func(q *landReq, res *LandResult, err error) {
+		q.res, q.err = res, err
+		close(q.done)
+	}
 	deadline := time.Now().Add(landTimeout)
-	for attempt := 1; maxAttempts <= 0 || attempt <= maxAttempts; attempt++ {
+	for attempt := 1; len(batch) > 0; attempt++ {
 		if attempt > 1 {
 			if time.Now().After(deadline) {
-				break
+				for _, q := range batch {
+					finish(q, nil, fmt.Errorf("%w: gave up after %d attempts", ErrStaleRef, q.attempts))
+				}
+				return
 			}
 			backoff := time.Duration(1<<min(attempt-2, 6)) * time.Millisecond
 			time.Sleep(time.Duration(rand.Int64N(int64(backoff) + 1)))
+			batch = append(batch, l.take()...) // late arrivals join the retry
 		}
-		res.Attempts = attempt
 		tip, err := r.DB.GetRef(ref)
 		if err == object.ErrNotFound {
 			tip, err = object.Zero, nil
 		}
 		if err != nil {
-			return nil, err
+			for _, q := range batch {
+				finish(q, nil, err)
+			}
+			return
 		}
-		res.Old = tip
-		target := head
-		res.Rebased, res.Merged = 0, false
-		if !tip.IsZero() {
-			ff, err := r.IsAncestor(tip, head)
+		cur := tip
+		var ok []*landReq
+		var results []*LandResult
+		for _, q := range batch {
+			q.attempts++
+			target, rebased, merged, err := r.landOnto(cur, q.head, q.author, q.when, ref)
+			if err == nil {
+				for _, c := range q.check {
+					if err = c(cur, target); err != nil {
+						break
+					}
+				}
+			}
 			if err != nil {
-				return nil, err
+				finish(q, nil, err)
+				continue
 			}
-			if !ff {
-				stack, ok, err := r.stackOnto(head, tip)
-				if err != nil {
-					return nil, err
-				}
-				if ok {
-					target = tip
-					for _, id := range stack {
-						if target, err = r.Rebase(id, target); err != nil {
-							return nil, err
-						}
-					}
-					res.Rebased = len(stack)
-				} else {
-					if target, err = r.Merge(tip, head, author, "Merge "+head.Short()+" into "+ref, when); err != nil {
-						return nil, err
-					}
-					res.Merged = true
-				}
+			ok = append(ok, q)
+			results = append(results, &LandResult{Old: cur, New: target, Rebased: rebased, Merged: merged})
+			cur = target
+		}
+		if len(ok) == 0 {
+			return
+		}
+		err = r.UpdateRef(ref, tip, cur)
+		if err == nil {
+			for i, q := range ok {
+				results[i].Attempts = q.attempts
+				finish(q, results[i], nil)
 			}
+			return
 		}
-		for _, c := range check {
-			if err := c(tip, target); err != nil {
-				return nil, err
+		if !errors.Is(err, ErrStaleRef) {
+			for _, q := range ok {
+				finish(q, nil, err)
 			}
+			return
 		}
-		err = r.UpdateRef(ref, tip, target)
-		if errors.Is(err, ErrStaleRef) {
-			continue
+		batch = batch[:0]
+		for _, q := range ok {
+			if q.max > 0 && q.attempts >= q.max {
+				finish(q, nil, fmt.Errorf("%w: gave up after %d attempts", ErrStaleRef, q.attempts))
+				continue
+			}
+			batch = append(batch, q)
 		}
-		if err != nil {
-			return nil, err
-		}
-		res.New = target
-		return res, nil
 	}
-	return nil, fmt.Errorf("%w: gave up after %d attempts", ErrStaleRef, res.Attempts)
+}
+
+// landOnto computes the changeset that lands head on top of tip.
+func (r *Repo) landOnto(tip, head object.ID, author string, when int64, ref string) (target object.ID, rebased int, merged bool, err error) {
+	if tip.IsZero() {
+		return head, 0, false, nil
+	}
+	ff, err := r.IsAncestor(tip, head)
+	if err != nil || ff {
+		return head, 0, false, err
+	}
+	stack, ok, err := r.stackOnto(head, tip)
+	if err != nil {
+		return object.Zero, 0, false, err
+	}
+	if !ok {
+		target, err = r.Merge(tip, head, author, "Merge "+head.Short()+" into "+ref, when)
+		return target, 0, true, err
+	}
+	target = tip
+	for _, id := range stack {
+		if target, err = r.Rebase(id, target); err != nil {
+			return object.Zero, 0, false, err
+		}
+	}
+	return target, len(stack), false, nil
 }
 
 // landTimeout bounds how long a land keeps retrying under contention.

@@ -455,3 +455,50 @@ func mustPayload(t *testing.T, b []byte) []byte {
 	}
 	return p
 }
+
+// TestCoalescedLandsFailIndividually lands many changesets concurrently on
+// one ref, some vetoed by their check: vetoed ones fail alone, every other
+// one lands exactly once.
+func TestCoalescedLandsFailIndividually(t *testing.T) {
+	r := newRepo(t)
+	base := commit(t, r, nil, "base", map[string]string{"README": "x\n"})
+	if err := r.UpdateRef("main", object.Zero, base); err != nil {
+		t.Fatal(err)
+	}
+	veto := errors.New("vetoed")
+	const n = 40
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		id := commit(t, r, []object.ID{base}, fmt.Sprint(i), map[string]string{fmt.Sprintf("f/%d.txt", i): "v\n"})
+		wg.Add(1)
+		go func(i int, id object.ID) {
+			defer wg.Done()
+			check := func(old, new object.ID) error {
+				if i%5 == 0 {
+					return veto
+				}
+				return nil
+			}
+			_, errs[i] = r.Land("main", id, "t", 1, 0, check)
+		}(i, id)
+	}
+	wg.Wait()
+	tip, _ := r.DB.GetRef("main")
+	root, _ := r.RootTree(tip)
+	for i, err := range errs {
+		_, ferr := r.Lookup(root, fmt.Sprintf("f/%d.txt", i))
+		switch {
+		case i%5 == 0 && !errors.Is(err, veto):
+			t.Fatalf("land %d: want veto, got %v", i, err)
+		case i%5 == 0 && ferr == nil:
+			t.Fatalf("vetoed land %d is in the tree", i)
+		case i%5 != 0 && (err != nil || ferr != nil):
+			t.Fatalf("land %d: %v / %v", i, err, ferr)
+		}
+	}
+	ids, _ := r.Log(tip, 0, false)
+	if len(ids) != 1+n-n/5 {
+		t.Fatalf("history has %d changesets, want %d", len(ids), 1+n-n/5)
+	}
+}

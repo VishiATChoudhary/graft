@@ -382,9 +382,12 @@ class Bench:
                 for i in range(3):
                     start(["serve", "--tier", "store", "--data", os.path.join(work, f"s{i}"), "--nodes", nodes, "--shard", str(i),
                            "--listen", f"127.0.0.1:749{i}"], f"http://127.0.0.1:749{i}")
-                for i in range(3):
-                    start(["serve", "--tier", "server", "--store", nodes, "--listen", f"127.0.0.1:750{i}"], f"http://127.0.0.1:750{i}")
-                apis = [f"http://127.0.0.1:750{i}" for i in range(3)]
+                napi = int(os.environ.get("FLEET_APIS", "3"))
+                peers = ",".join(f"http://127.0.0.1:750{i}" for i in range(napi))
+                for i in range(napi):
+                    start(["serve", "--tier", "server", "--store", nodes, "--peers", peers, "--self", str(i),
+                           "--listen", f"127.0.0.1:750{i}"], f"http://127.0.0.1:750{i}")
+                apis = [f"http://127.0.0.1:750{i}" for i in range(napi)]
             run([GFT, "write", "--server", apis[0], "--parent", "", "--land", "main", "-m", "init", "README=hello"])
             def agent(a):
                 api = apis[a % len(apis)]
@@ -404,6 +407,14 @@ class Bench:
                  "lands": agents * per_agent, "retries": 0, "lands_per_s": agents * per_agent / wall, "reps": 1}
             self.results.append(r)
             print(f"  {r['system']:<34} {wall*1000:10.1f} ms   {r['lands_per_s']:.1f} lands/s (verified linear)", flush=True)
+            cpu = 0.0
+            for p in procs:
+                out = subprocess.run(["ps", "-o", "time=", "-p", str(p.pid)], capture_output=True, text=True).stdout.strip()
+                if out:
+                    m, sec = out.split(":")[-2:]
+                    cpu += int(m) * 60 + float(sec)
+            r["cpu_s"] = cpu
+            print(f"    server CPU {cpu:.2f} s ({cpu * 1000 / r['lands']:.1f} ms per land)", flush=True)
             for p in procs:
                 p.send_signal(signal.SIGTERM)
             for p in procs:

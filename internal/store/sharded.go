@@ -54,12 +54,13 @@ type Sharded struct {
 	// Write-behind for objects: PutBase returns once the write is queued;
 	// barrier() waits for every queued write before anything that can
 	// reference those objects is published (log, derived data, refs).
-	queued   sync.Map // ID -> stored bytes, until written
-	waiting  map[uint64]chan struct{}
-	ticket   uint64
-	pendMu   sync.Mutex
-	pendErr  error
-	inflight chan struct{}
+	queued        sync.Map // ID -> stored bytes, until written
+	queuedDerived sync.Map // derivedKey -> value, until written
+	waiting       map[uint64]chan struct{}
+	ticket        uint64
+	pendMu        sync.Mutex
+	pendErr       error
+	inflight      chan struct{}
 }
 
 // ShardOf returns the shard index for an ID (by its storage prefix).
@@ -438,6 +439,9 @@ func (s *Sharded) GetDerived(kind string, id object.ID) ([]byte, error) {
 	if v, ok := s.derived.Load(derivedKey{kind, id}); ok {
 		return v.([]byte), nil
 	}
+	if v, ok := s.queuedDerived.Load(derivedKey{kind, id}); ok {
+		return v.([]byte), nil
+	}
 	body, err := s.readAny(s.replicas(id), "/kv/derived/get?kind="+kind, id[:], func(b []byte) bool { return oneFrame(b) != nil },
 		func(missed []string, b []byte) {
 			if v := oneFrame(b); v != nil {
@@ -465,14 +469,39 @@ func (s *Sharded) cacheDerived(kind string, id object.ID, v []byte) {
 	s.dbytes += int64(len(v)) + 64
 }
 
+// PutDerived is write-behind: the value is readable here at once and is
+// written once every object queued before it is stored (so derived data
+// never refers to objects not yet durable). Barriers wait for it too.
 func (s *Sharded) PutDerived(kind string, id object.ID, v []byte) error {
-	if err := s.barrier(); err != nil {
-		return err
-	}
-	if err := s.writeAll(s.replicas(id), "/kv/derived/put?kind="+kind, derivedFrame(id, v)); err != nil {
-		return err
-	}
 	s.cacheDerived(kind, id, v)
+	k := derivedKey{kind, id}
+	s.queuedDerived.Store(k, v)
+	s.pendMu.Lock()
+	prior := make([]chan struct{}, 0, len(s.waiting))
+	for _, c := range s.waiting {
+		prior = append(prior, c)
+	}
+	done := make(chan struct{})
+	s.ticket++
+	t := s.ticket
+	s.waiting[t] = done
+	s.pendMu.Unlock()
+	go func() {
+		for _, c := range prior {
+			<-c
+		}
+		s.inflight <- struct{}{}
+		err := s.writeAll(s.replicas(id), "/kv/derived/put?kind="+kind, derivedFrame(id, v))
+		<-s.inflight
+		s.queuedDerived.Delete(k)
+		s.pendMu.Lock()
+		if err != nil && s.pendErr == nil {
+			s.pendErr = err
+		}
+		delete(s.waiting, t)
+		s.pendMu.Unlock()
+		close(done)
+	}()
 	return nil
 }
 
