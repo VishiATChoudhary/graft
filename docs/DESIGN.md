@@ -298,9 +298,14 @@ renames are followed. Server-side merges use diff3.
   server; on 2026-10-14 it was also run against a real Cloud Spanner
   instance (regional-us-west1, 100 processing units, a fresh database per
   test: `GRAFT_TEST_SPANNER=1 GRAFT_SPANNER_INSTANCE=projects/P/instances/I
-  go test -tags cloud ./internal/repo/`), with an end-to-end `gft serve
-  --spanner --blobs` smoke test (write, land, change request through the
-  merge queue, log, grep, clone). Spanner rows hold each object's
+  go test -tags cloud ./internal/repo/`). Passed there: trees and history,
+  rebase/merge/land, concurrent landing, coalesced landing (failure
+  isolation; conflicts and stacks), grep, indexed grep and path search,
+  plus an end-to-end `gft serve --spanner --blobs` smoke test (write,
+  land, change request through the merge queue, log, grep, clone). Not
+  run there: the 1,500-changeset skip-list test (hours at that network's
+  0.4 to 1.7 s per operation; it exercises no backend operation the
+  others do not) and tests that need a local store. Spanner rows hold each object's
   standard compressed form, without graft's delta encodings, so the dense
   storage numbers apply to the pebble backends. Self-hosted alternative:
   pebble shards replicated by graft itself (majority writes, Raft for refs
