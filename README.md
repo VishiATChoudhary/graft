@@ -52,7 +52,8 @@ daemon. CPU counts client **and** server. Median of 5 runs; full table in
 | Virtual checkout + read 1 package | (needs a clone) | **86 ms** | |
 | Full checkout, 100k files | 9.0 s (`--depth 1`) | **4.7 s**, less CPU | 1.9x |
 | Move a working copy forward 100 commits | 148 ms, 603 ms CPU | **52 ms, 78 ms CPU** | 2.8x, 8x less CPU |
-| 16 agents x 8 concurrent lands | 3.6 lands/s, 442 push retries, 224 s CPU | **196 lands/s**, 2.3 s CPU | **54x throughput, 95x less CPU** |
+| 16 agents x 8 concurrent lands | 4.0 lands/s, 417 push retries, 195 s CPU | **244 lands/s**, 3.1 s CPU | **61x throughput, 63x less CPU** |
+| 128 agents x 8 lands, one load generator | | **4,900 lands/s** one server; 2,500 on 3 API servers + 3 shards | |
 | Search all 100k files (fixed string) | 2.1 s `git grep` (in a full clone) | **64 ms** (server-side, no clone) | 32x |
 | Log of one file | 54 ms (in a full clone) | **9 ms** (no clone) | 6x |
 | Blame of a hot file | 91 ms (in a full clone) | **8 ms** memoized, 108 ms first time (no clone) | |
@@ -170,10 +171,20 @@ gft serve --tier store --data /data --nodes "$NODES" --shard 0 --replica 1 \
 
 API servers are caches that compute derived data and write it back, so they
 hold no state of their own. Delta bases are resolved across shards, so
-storage stays dense. On a single
-machine, three API servers over three shards land 139 lands/s versus 200 for
-one server: the extra hops cost latency, and the point of the fleet is
-spreading load across machines.
+storage stays dense.
+
+Landing is lock-free but coalesced: lands for one ref that arrive at a
+server while another is in flight are rebased in a chain and published with
+one CAS, each still checked and failing on its own. With `--peers` and
+`--self`, API servers forward a land to the server that owns the ref (by
+hash), so a ref's lands meet in one place; if the owner is down, any server
+lands it and the CAS keeps it correct. Measured with `gft loadgen` (128
+agents, after a warm-up round) on one 10-core machine: one server lands
+about 4,900 to 8,400 per second and three API servers over three shards
+about 2,500 to 4,900. On one machine the fleet does the same serial
+per-ref work plus serialization and loopback hops, so it does not beat an
+in-process server there; it exists to spread load over machines and to
+survive the loss of any of them.
 
 ## Access control and review
 

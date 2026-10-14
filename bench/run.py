@@ -358,63 +358,50 @@ class Bench:
         r["lands_per_s"] = r["lands"] / r["wall_s"]
         print(f"    -> {r['lands_per_s']:.1f} lands/s, {r['retries']} CAS retries (handled server-side)")
 
-    def fleet_land(self, agents=32, per_agent=4):
-        print(f"\n[land-fleet] {agents} agents x {per_agent} lands: 1 server vs 3 storage shards + 3 API servers", flush=True)
-        results = {}
+    def fleet_land(self, agents=128, per_agent=8, reps=3):
+        print(f"\n[land-fleet] {agents} agents x {per_agent} lands from one load generator: 1 server vs 3 storage shards + 3 API servers", flush=True)
         for mode in ("single", "fleet"):
             work = self.path("fleet-" + mode)
             shutil.rmtree(work, ignore_errors=True)
             os.makedirs(work)
             procs = []
-            def start(args, url):
+            def start(args, url, ready):
                 procs.append(subprocess.Popen([GFT] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-                for _ in range(200):
+                for _ in range(400):
                     try:
-                        urllib.request.urlopen(url + "/v1/info").read()
+                        urllib.request.urlopen(url + ready).read()
                         return
                     except Exception:
                         time.sleep(0.05)
             if mode == "single":
-                start(["serve", "--tier", "server", "--data", os.path.join(work, "d"), "--listen", "127.0.0.1:7480"], "http://127.0.0.1:7480")
+                start(["serve", "--tier", "server", "--data", os.path.join(work, "d"), "--listen", "127.0.0.1:7480"], "http://127.0.0.1:7480", "/v1/info")
                 apis = ["http://127.0.0.1:7480"]
             else:
                 nodes = ",".join(f"http://127.0.0.1:749{i}" for i in range(3))
                 for i in range(3):
                     start(["serve", "--tier", "store", "--data", os.path.join(work, f"s{i}"), "--nodes", nodes, "--shard", str(i),
-                           "--listen", f"127.0.0.1:749{i}"], f"http://127.0.0.1:749{i}")
-                napi = int(os.environ.get("FLEET_APIS", "3"))
-                peers = ",".join(f"http://127.0.0.1:750{i}" for i in range(napi))
-                for i in range(napi):
+                           "--listen", f"127.0.0.1:749{i}"], f"http://127.0.0.1:749{i}", "/")
+                apis = [f"http://127.0.0.1:750{i}" for i in range(3)]
+                peers = ",".join(apis)
+                for i in range(3):
                     start(["serve", "--tier", "server", "--store", nodes, "--peers", peers, "--self", str(i),
-                           "--listen", f"127.0.0.1:750{i}"], f"http://127.0.0.1:750{i}")
-                apis = [f"http://127.0.0.1:750{i}" for i in range(napi)]
+                           "--listen", f"127.0.0.1:750{i}"], apis[i], "/v1/info")
+            servers = ",".join(apis)
             run([GFT, "write", "--server", apis[0], "--parent", "", "--land", "main", "-m", "init", "README=hello"])
-            def agent(a):
-                api = apis[a % len(apis)]
-                for k in range(per_agent):
-                    run([GFT, "write", "--server", api, "--parent", "main", "--land", "main", "-m", f"agent {a} change {k}",
-                         f"agents/{a}/{k}.txt=change {k}"])
-            ts = [threading.Thread(target=agent, args=(a,)) for a in range(agents)]
-            t0 = time.perf_counter()
-            for t in ts:
-                t.start()
-            for t in ts:
-                t.join()
-            wall = time.perf_counter() - t0
-            log = json.load(urllib.request.urlopen(apis[-1] + "/v1/resolve?rev=main"))
-            assert log["depth"] == agents * per_agent, f"{mode}: lost lands ({log['depth']})"
-            r = {"scenario": "land-fleet", "system": f"gft {mode} ({len(apis)} API server(s))", "wall_s": wall, "cpu_s": 0,
-                 "lands": agents * per_agent, "retries": 0, "lands_per_s": agents * per_agent / wall, "reps": 1}
+            # Warm up past one-time work (connections, caches, the stores'
+            # dictionary training), as a long-running service would be.
+            run([GFT, "loadgen", "--servers", servers, "--agents", "256", "--per", "24", "--prefix", "warm"])
+            time.sleep(3)
+            rates = []
+            for k in range(reps):
+                out = subprocess.run([GFT, "loadgen", "--servers", servers, "--agents", str(agents), "--per", str(per_agent),
+                                      "--prefix", f"run{k}"], capture_output=True, text=True, check=True).stdout
+                rates.append(float(re.search(r"([\d.]+) lands/s", out).group(1)))
+            rate = statistics.median(rates)
+            r = {"scenario": "land-fleet", "system": f"gft {mode} ({len(apis)} API server(s))", "wall_s": agents * per_agent / rate,
+                 "cpu_s": 0, "lands": agents * per_agent, "retries": 0, "lands_per_s": rate, "reps": reps}
             self.results.append(r)
-            print(f"  {r['system']:<34} {wall*1000:10.1f} ms   {r['lands_per_s']:.1f} lands/s (verified linear)", flush=True)
-            cpu = 0.0
-            for p in procs:
-                out = subprocess.run(["ps", "-o", "time=", "-p", str(p.pid)], capture_output=True, text=True).stdout.strip()
-                if out:
-                    m, sec = out.split(":")[-2:]
-                    cpu += int(m) * 60 + float(sec)
-            r["cpu_s"] = cpu
-            print(f"    server CPU {cpu:.2f} s ({cpu * 1000 / r['lands']:.1f} ms per land)", flush=True)
+            print(f"  {r['system']:<34} {rate:10.0f} lands/s (median of {reps}, each verified)", flush=True)
             for p in procs:
                 p.send_signal(signal.SIGTERM)
             for p in procs:

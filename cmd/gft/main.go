@@ -1061,6 +1061,7 @@ func cmdLoadgen(args []string) error {
 	agents := fs.Int("agents", 64, "concurrent agents")
 	per := fs.Int("per", 8, "lands per agent")
 	ref := fs.String("ref", "main", "ref to land on")
+	prefix := fs.String("prefix", "agents", "directory for the agents' files")
 	parse(fs, args)
 	urls := strings.Split(*servers, ",")
 	c0, _ := apiClient(urls[len(urls)-1])
@@ -1078,7 +1079,7 @@ func cmdLoadgen(args []string) error {
 			c, _ := apiClient(urls[a%len(urls)])
 			for k := 0; k < *per; k++ {
 				req := &api.WriteRequest{Parent: *ref, Author: "loadgen", Message: fmt.Sprintf("agent %d change %d", a, k), Land: *ref,
-					Files: []api.WriteFile{{Path: fmt.Sprintf("agents/%d/%d.txt", a, k), Content: []byte(fmt.Sprintf("change %d\n", k))}}}
+					Files: []api.WriteFile{{Path: fmt.Sprintf("%s/%d/%d.txt", *prefix, a, k), Content: []byte(fmt.Sprintf("change %d\n", k))}}}
 				if _, err := c.Write(bg(), req); err != nil {
 					errs <- err
 					return
@@ -1103,7 +1104,7 @@ func cmdLoadgen(args []string) error {
 		return fmt.Errorf("verify: history depth %d, want %d", after.Depth, before.Depth+uint64(n))
 	}
 	for a := 0; a < *agents; a++ {
-		ents, err := c0.Ls(bg(), after.ID.String(), fmt.Sprintf("agents/%d", a))
+		ents, err := c0.Ls(bg(), after.ID.String(), fmt.Sprintf("%s/%d", *prefix, a))
 		if err != nil || len(ents) != *per {
 			return fmt.Errorf("verify: agent %d has %d files (%v), want %d", a, len(ents), err, *per)
 		}

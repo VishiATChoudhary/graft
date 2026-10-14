@@ -114,10 +114,27 @@ a periodically refreshed snapshot (`gft snapshot`, `--seed`).
    per touched path; conflicts are reported with paths).
 4. Compare-and-swap the ref. If another land won the race, go to 1.
 
-There is no global lock. Landing many changes concurrently costs one CAS each
-plus a rebase of the loser, which is proportional to the loser's change. This
-matches the post's move away from a global merge-queue lock toward post-merge
-testing.
+There is no global lock. This matches the post's move away from a global
+merge-queue lock toward post-merge testing.
+
+**Coalescing.** Lands for one ref that reach a server while another is in
+flight queue up; one goroutine takes the queue, rebases each request onto
+the previous result, and publishes the whole chain with a single CAS. Each
+request is still checked (permissions, reviews) against exactly its own
+change and fails alone (a conflict or a veto drops that request, not the
+batch). Inside a batch, rebased changesets are stored with their root trees
+computed directly from the previous root and appended to the log together
+in one request (one Raft command), then their derived data is computed.
+Inputs every request will need are prefetched in parallel first.
+
+**Ref affinity.** With `--peers`, an API server forwards a land to the peer
+that owns the ref (hash of its name), so a ref's lands coalesce on one
+server rather than racing across servers. It is only a routing hint: any
+server can land any ref, and the CAS keeps it correct if the owner is down.
+
+**Write-and-land.** A changeset created only to be landed is stored and
+logged without computing its derived data, since the land rebases it at
+once; stack walks take its depth from its parent.
 
 ## Storage (`internal/store`)
 
@@ -169,7 +186,20 @@ set (`--nodes a|b|c,d|e|f`):
 
 `gft serve --tier server --store ...` runs a stateless API server over the
 fleet. It caches everything immutable and computes derived data, writing the
-results back, so any number can run. A shard resolves delta bases held by
+results back, so any number can run.
+
+Writes from an API server are write-behind with explicit ordering:
+
+* object writes are group-committed per shard (what queues up while a
+  request is in flight goes in the next request) and readable on that
+  server at once;
+* a log append waits only for the changeset and its blobs to be durable
+  (trees are derived data; parents are already logged); a ref CAS needs no
+  wait, since a ref can only name a logged changeset;
+* derived writes go through one ordered writer per server, each batch after
+  the object writes queued before it, so a record never becomes visible
+  before records it refers to. Derived data is a cache: publishing never
+  waits for it, and a lost history batch is regenerated from its changeset. A shard resolves delta bases held by
 other shards from any of their replicas. Tests run the repository suite
 against a 3-shard fleet, land concurrently through three API servers, and
 kill the Raft leader and a data replica mid-workload (two shards x three
