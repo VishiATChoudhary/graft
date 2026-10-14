@@ -29,7 +29,8 @@ type Repo struct {
 	// subtrees).
 	OnCreate func(id object.ID)
 
-	landers sync.Map // ref -> *lander (coalesced lands)
+	landers   sync.Map // ref -> *lander (coalesced lands)
+	rootHints sync.Map // changeset -> root tree, for rebases not yet logged
 
 	cs *derive.Type // changeset -> root tree, history root, commit graph (one record)
 
@@ -121,19 +122,27 @@ func (r *Repo) append(cs *object.Changeset) (object.ID, error) {
 	if _, err := r.DB.AppendLog(id); err != nil {
 		return object.Zero, err
 	}
+	return id, r.finishAppend(id)
+}
+
+// finishAppend computes a newly logged changeset's eager derived data.
+func (r *Repo) finishAppend(id object.ID) error {
 	for _, t := range r.eng.EagerTypes() {
-		if _, err := r.eng.Get(t, id); err != nil {
-			return object.Zero, err
+		if _, err := r.eng.Derive(t, id); err != nil {
+			return err
 		}
 	}
 	if r.OnCreate != nil {
 		r.OnCreate(id)
 	}
-	return id, nil
+	return nil
 }
 
 // RootTree returns the root tree of a changeset (Zero for an empty tree).
 func (r *Repo) RootTree(id object.ID) (object.ID, error) {
+	if v, ok := r.rootHints.Load(id); ok {
+		return v.(object.ID), nil
+	}
 	c, err := r.csInfo(id)
 	if err != nil {
 		return object.Zero, err

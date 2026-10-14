@@ -99,6 +99,17 @@ func (e *Engine) Peek(t *Type, id object.ID) ([]byte, bool, error) {
 	return v, true, nil
 }
 
+// Derive computes and stores t at id without first looking for a stored
+// value: for a changeset just added, where none can exist yet, this saves
+// a store lookup per type. Values are deterministic, so recomputing an
+// existing one is harmless.
+func (e *Engine) Derive(t *Type, id object.ID) ([]byte, error) {
+	if v, err := t.mem.Get(id); err == nil {
+		return v, nil
+	}
+	return e.derive(t, id)
+}
+
 // Get returns the value of t at id, deriving it (and any missing ancestor
 // values) if needed. Derivation is iterative so arbitrarily long histories
 // do not overflow the stack.

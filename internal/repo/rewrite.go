@@ -96,23 +96,33 @@ func collectConflicts(err error, acc *[]string) error {
 // returning the new changeset ID. Only the paths the changeset touched are
 // examined, so the cost is proportional to the change.
 func (r *Repo) Rebase(id, onto object.ID) (object.ID, error) {
+	out, err := r.rebased(id, onto)
+	if err != nil || out == nil {
+		return id, err
+	}
+	return r.append(out)
+}
+
+// rebased builds the changeset replaying id onto onto (nil if id's parent
+// already is onto).
+func (r *Repo) rebased(id, onto object.ID) (*object.Changeset, error) {
 	cs, err := r.Changeset(id)
 	if err != nil {
-		return object.Zero, err
+		return nil, err
 	}
 	if len(cs.Parents) != 1 {
-		return object.Zero, fmt.Errorf("rebase: %s has %d parents; only single-parent changesets can be rebased", id.Short(), len(cs.Parents))
+		return nil, fmt.Errorf("rebase: %s has %d parents; only single-parent changesets can be rebased", id.Short(), len(cs.Parents))
 	}
 	if cs.Parents[0] == onto {
-		return id, nil
+		return nil, nil
 	}
 	baseRoot, err := r.RootTree(cs.Parents[0])
 	if err != nil {
-		return object.Zero, err
+		return nil, err
 	}
 	ontoRoot, err := r.RootTree(onto)
 	if err != nil {
-		return object.Zero, err
+		return nil, err
 	}
 	out := &object.Changeset{Parents: []object.ID{onto}, Author: cs.Author, Time: cs.Time, TZ: cs.TZ, Message: cs.Message}
 	var conflicts []string
@@ -122,16 +132,71 @@ func (r *Repo) Rebase(id, onto object.ID) (object.ID, error) {
 		theirs := object.TreeEntry{Mode: ch.Mode, ID: ch.Blob}
 		c, need, err := r.merge3File(ch.Path, base, ours, theirs, "onto "+onto.Short(), id.Short())
 		if err = collectConflicts(err, &conflicts); err != nil {
-			return object.Zero, err
+			return nil, err
 		}
 		if need {
 			out.Changes = append(out.Changes, c)
 		}
 	}
 	if len(conflicts) > 0 {
-		return object.Zero, &ConflictError{Paths: conflicts}
+		return nil, &ConflictError{Paths: conflicts}
 	}
-	return r.append(out)
+	return out, nil
+}
+
+// rebaseDeferred is Rebase without publishing: the changeset is stored and
+// its root tree computed and remembered, but it is not appended to the log
+// yet. A land batch appends all of them in one request (appendDeferred).
+func (r *Repo) rebaseDeferred(id, onto object.ID) (object.ID, bool, error) {
+	out, err := r.rebased(id, onto)
+	if err != nil || out == nil {
+		return id, false, err
+	}
+	ontoRoot, err := r.RootTree(onto)
+	if err != nil {
+		return object.Zero, false, err
+	}
+	nid, stored := object.Encode(object.KindChangeset, out.Encode())
+	if err := r.DB.Put(nid, stored); err != nil {
+		return object.Zero, false, err
+	}
+	root, err := r.applyTree(ontoRoot, out.Changes)
+	if err != nil {
+		return object.Zero, false, err
+	}
+	r.rootHints.Store(nid, root)
+	return nid, true, nil
+}
+
+// logBatcher is implemented by backends that append several changesets
+// in one request.
+type logBatcher interface {
+	AppendLogs(ids []object.ID) ([]uint64, error)
+}
+
+// appendDeferred publishes deferred changesets in order and computes their
+// eager derived data.
+func (r *Repo) appendDeferred(ids []object.ID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if lb, ok := r.DB.(logBatcher); ok {
+		if _, err := lb.AppendLogs(ids); err != nil {
+			return err
+		}
+	} else {
+		for _, id := range ids {
+			if _, err := r.DB.AppendLog(id); err != nil {
+				return err
+			}
+		}
+	}
+	for _, id := range ids {
+		if err := r.finishAppend(id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Merge creates a two-parent changeset joining b into a. If b is already
@@ -323,12 +388,23 @@ func (r *Repo) landBatch(ref string, l *lander, batch []*landReq) {
 			return
 		}
 		r.prefetchLands(tip, batch)
-		cur := tip
+		cur, logged := tip, tip
+		var deferred []object.ID
+		flush := func() error {
+			err := r.appendDeferred(deferred)
+			deferred = deferred[:0]
+			logged = cur
+			return err
+		}
 		var ok []*landReq
 		var results []*LandResult
 		for _, q := range batch {
 			q.attempts++
-			target, rebased, merged, err := r.landOnto(cur, q.head, q.author, q.when, ref)
+			if len(deferred) == 0 {
+				logged = cur
+			}
+			target, rebased, merged, newly, err := r.landOnto(logged, cur, q.head, q.author, q.when, ref, len(deferred) > 0, flush)
+			deferred = append(deferred, newly...)
 			if err == nil {
 				for _, c := range q.check {
 					if err = c(cur, target); err != nil {
@@ -343,6 +419,12 @@ func (r *Repo) landBatch(ref string, l *lander, batch []*landReq) {
 			ok = append(ok, q)
 			results = append(results, &LandResult{Old: cur, New: target, Rebased: rebased, Merged: merged})
 			cur = target
+		}
+		if err := flush(); err != nil {
+			for _, q := range ok {
+				finish(q, nil, err)
+			}
+			return
 		}
 		if len(ok) == 0 {
 			return
@@ -410,30 +492,46 @@ func (r *Repo) prefetchLands(tip object.ID, batch []*landReq) {
 	wg.Wait()
 }
 
-// landOnto computes the changeset that lands head on top of tip.
-func (r *Repo) landOnto(tip, head object.ID, author string, when int64, ref string) (target object.ID, rebased int, merged bool, err error) {
-	if tip.IsZero() {
-		return head, 0, false, nil
+// landOnto computes the changeset that lands head on top of cur. logged
+// is the newest logged changeset on the batch's chain (cur itself unless
+// pending is set, meaning cur and some of its ancestors are deferred
+// rebases not yet in the log). Rebases are deferred and returned in newly;
+// anything needing cur's ancestry (a merge) flushes the deferred ones first.
+func (r *Repo) landOnto(logged, cur, head object.ID, author string, when int64, ref string, pending bool, flush func() error) (target object.ID, rebased int, merged bool, newly []object.ID, err error) {
+	if cur.IsZero() {
+		return head, 0, false, nil, nil
 	}
-	ff, err := r.IsAncestor(tip, head)
-	if err != nil || ff {
-		return head, 0, false, err
-	}
-	stack, ok, err := r.stackOnto(head, tip)
-	if err != nil {
-		return object.Zero, 0, false, err
-	}
-	if !ok {
-		target, err = r.Merge(tip, head, author, "Merge "+head.Short()+" into "+ref, when)
-		return target, 0, true, err
-	}
-	target = tip
-	for _, id := range stack {
-		if target, err = r.Rebase(id, target); err != nil {
-			return object.Zero, 0, false, err
+	if !pending {
+		ff, err := r.IsAncestor(cur, head)
+		if err != nil || ff {
+			return head, 0, false, nil, err
 		}
 	}
-	return target, len(stack), false, nil
+	stack, ok, err := r.stackOnto(head, logged)
+	if err != nil {
+		return object.Zero, 0, false, nil, err
+	}
+	if !ok {
+		if pending {
+			if err := flush(); err != nil {
+				return object.Zero, 0, false, nil, err
+			}
+		}
+		target, err = r.Merge(cur, head, author, "Merge "+head.Short()+" into "+ref, when)
+		return target, 0, true, nil, err
+	}
+	target = cur
+	for _, id := range stack {
+		nid, isNew, err := r.rebaseDeferred(id, target)
+		if err != nil {
+			return object.Zero, 0, false, newly, err
+		}
+		if isNew {
+			newly = append(newly, nid)
+		}
+		target = nid
+	}
+	return target, len(stack), false, newly, nil
 }
 
 // landTimeout bounds how long a land keeps retrying under contention.

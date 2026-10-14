@@ -35,7 +35,7 @@ func (e *NotLeaderError) Error() string { return "not the metadata leader (leade
 
 const (
 	cmdCAS    = 1
-	cmdAppend = 2
+	cmdAppend = 2 // one or more changesets, in order
 )
 
 type casResult struct {
@@ -44,8 +44,8 @@ type casResult struct {
 }
 
 type appendResult struct {
-	seq uint64
-	err error
+	seqs []uint64
+	err  error
 }
 
 type metaFSM struct{ db *DB }
@@ -63,8 +63,15 @@ func (f *metaFSM) Apply(l *raft.Log) interface{} {
 		}
 		return casResult{new, err}
 	case cmdAppend:
-		seq, err := f.db.AppendLog(d.ID())
-		return appendResult{seq, err}
+		var res appendResult
+		for len(d.B) > 0 && d.Err == nil {
+			seq, err := f.db.AppendLog(d.ID())
+			if err != nil {
+				return appendResult{err: err}
+			}
+			res.seqs = append(res.seqs, seq)
+		}
+		return res
 	}
 	return fmt.Errorf("unknown metadata command")
 }
@@ -260,17 +267,20 @@ func (m *MetaGroup) CASRef(name string, old, new object.ID) error {
 	return v.(casResult).err
 }
 
-// AppendLog assigns a replicated log sequence.
-func (m *MetaGroup) AppendLog(id object.ID) (uint64, error) {
+// AppendLogs assigns replicated log sequences to changesets, in order, in
+// one Raft command.
+func (m *MetaGroup) AppendLogs(ids []object.ID) ([]uint64, error) {
 	var e object.Encoder
 	e.Byte(cmdAppend)
-	e.ID(id)
+	for _, id := range ids {
+		e.ID(id)
+	}
 	v, err := m.apply(e.B)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	res := v.(appendResult)
-	return res.seq, res.err
+	return res.seqs, res.err
 }
 
 // ReadBarrier makes a linearizable read possible: only the leader, after

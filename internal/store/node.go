@@ -232,9 +232,19 @@ func NodeHandler(db *DB, meta *MetaGroup) http.Handler {
 		return meta.ReadBarrier()
 	}
 	casRef := db.CASRef
-	appendLog := db.AppendLog
+	appendLogs := func(list []object.ID) ([]uint64, error) {
+		out := make([]uint64, 0, len(list))
+		for _, id := range list {
+			seq, err := db.AppendLog(id)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, seq)
+		}
+		return out, nil
+	}
 	if meta != nil {
-		casRef, appendLog = meta.CASRef, meta.AppendLog
+		casRef, appendLogs = meta.CASRef, meta.AppendLogs
 	}
 	// Followers may lag: a log entry they lack may exist on the leader.
 	lagging := func(err error) error {
@@ -288,16 +298,21 @@ func NodeHandler(db *DB, meta *MetaGroup) http.Handler {
 		json.NewEncoder(w).Encode(refs)
 	})
 	mux.HandleFunc("/kv/log/append", func(w http.ResponseWriter, r *http.Request) {
+		// One or more changesets, appended in order (one Raft command).
 		list, ok := ids(w, r)
-		if !ok || len(list) != 1 {
+		if !ok || len(list) == 0 {
 			return
 		}
-		seq, err := appendLog(list[0])
+		seqs, err := appendLogs(list)
 		if err != nil {
 			fail(w, err)
 			return
 		}
-		w.Write(be64(seq))
+		out := make([]byte, 0, 8*len(seqs))
+		for _, s := range seqs {
+			out = append(out, be64(s)...)
+		}
+		w.Write(out)
 	})
 	mux.HandleFunc("/kv/log/seq", func(w http.ResponseWriter, r *http.Request) {
 		list, ok := ids(w, r)

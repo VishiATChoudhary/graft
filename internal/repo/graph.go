@@ -135,7 +135,10 @@ func (r *Repo) computeCS(id object.ID, parents []object.ID, vals [][]byte) ([]by
 	if p1 != nil {
 		baseRoot = p1.Root
 	}
-	if c.Root, err = r.applyTree(baseRoot, cs.Changes); err != nil {
+	if v, ok := r.rootHints.Load(id); ok { // computed when it was rebased
+		c.Root = v.(object.ID)
+		defer r.rootHints.Delete(id)
+	} else if c.Root, err = r.applyTree(baseRoot, cs.Changes); err != nil {
 		return nil, err
 	}
 	// Merges: the other parents' versions of merged paths would otherwise

@@ -567,32 +567,49 @@ func (s *Sharded) ListRefs() (map[string]object.ID, error) {
 // blobs are durable (trees are derived data; parents are already logged).
 // It waits only for those writes, not for unrelated concurrent requests.
 func (s *Sharded) AppendLog(id object.ID) (uint64, error) {
-	deps := []object.ID{id}
-	if v, ok := s.queued.Load(id); ok {
-		if _, p, err := object.Unpack(v.([]byte)); err == nil {
-			if cs, err := object.DecodeChangeset(p); err == nil {
-				for _, ch := range cs.Changes {
-					if !ch.Blob.IsZero() {
-						deps = append(deps, ch.Blob)
+	seqs, err := s.AppendLogs([]object.ID{id})
+	if err != nil {
+		return 0, err
+	}
+	return seqs[0], nil
+}
+
+// AppendLogs appends several changesets, in order, in one request.
+func (s *Sharded) AppendLogs(list []object.ID) ([]uint64, error) {
+	var deps []object.ID
+	body := make([]byte, 0, len(list)*len(object.Zero))
+	for _, id := range list {
+		body = append(body, id[:]...)
+		deps = append(deps, id)
+		if v, ok := s.queued.Load(id); ok {
+			if _, p, err := object.Unpack(v.([]byte)); err == nil {
+				if cs, err := object.DecodeChangeset(p); err == nil {
+					for _, ch := range cs.Changes {
+						if !ch.Blob.IsZero() {
+							deps = append(deps, ch.Blob)
+						}
 					}
 				}
 			}
 		}
 	}
 	if err := s.waitFor(deps...); err != nil {
-		return 0, err
+		return nil, err
 	}
-	body, _, err := s.meta("POST", "/kv/log/append", id[:])
+	resp, _, err := s.meta("POST", "/kv/log/append", body)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if len(body) != 8 {
-		return 0, object.ErrCorrupt
+	if len(resp) != 8*len(list) {
+		return nil, object.ErrCorrupt
 	}
-	seq := binary.BigEndian.Uint64(body)
-	s.seqs.Store(id, seq)
-	s.ids.Store(seq, id)
-	return seq, nil
+	seqs := make([]uint64, len(list))
+	for i, id := range list {
+		seqs[i] = binary.BigEndian.Uint64(resp[8*i:])
+		s.seqs.Store(id, seqs[i])
+		s.ids.Store(seqs[i], id)
+	}
+	return seqs, nil
 }
 
 func (s *Sharded) LogSeq(id object.ID) (uint64, error) {

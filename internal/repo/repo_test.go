@@ -502,3 +502,61 @@ func TestCoalescedLandsFailIndividually(t *testing.T) {
 		t.Fatalf("history has %d changesets, want %d", len(ids), 1+n-n/5)
 	}
 }
+
+// TestCoalescedLandsConflictsAndStacks lands, concurrently, two-changeset
+// stacks and changesets editing the same file: conflicting ones fail
+// alone, stacks land whole, and every landed tree has the expected files.
+func TestCoalescedLandsConflictsAndStacks(t *testing.T) {
+	r := newRepo(t)
+	base := commit(t, r, nil, "base", map[string]string{"shared.txt": "a\nb\nc\n"})
+	if err := r.UpdateRef("main", object.Zero, base); err != nil {
+		t.Fatal(err)
+	}
+	const n = 30
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		var head object.ID
+		if i%3 == 0 { // all edit the same line: at most one can land
+			head = commit(t, r, []object.ID{base}, fmt.Sprint(i), map[string]string{"shared.txt": fmt.Sprintf("a\nb%d\nc\n", i)})
+		} else { // a stack of two
+			c1 := commit(t, r, []object.ID{base}, fmt.Sprint(i, "a"), map[string]string{fmt.Sprintf("s/%d/1.txt", i): "1\n"})
+			head = commit(t, r, []object.ID{c1}, fmt.Sprint(i, "b"), map[string]string{fmt.Sprintf("s/%d/2.txt", i): "2\n"})
+		}
+		wg.Add(1)
+		go func(i int, id object.ID) {
+			defer wg.Done()
+			_, errs[i] = r.Land("main", id, "t", 1, 0)
+		}(i, head)
+	}
+	wg.Wait()
+	tip, _ := r.DB.GetRef("main")
+	root, _ := r.RootTree(tip)
+	landedShared := 0
+	for i, err := range errs {
+		if i%3 == 0 {
+			var ce *ConflictError
+			if err == nil {
+				landedShared++
+			} else if !errors.As(err, &ce) {
+				t.Fatalf("land %d: want conflict or success, got %v", i, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("stack %d: %v", i, err)
+		}
+		for _, f := range []string{"1", "2"} {
+			if _, err := r.Lookup(root, fmt.Sprintf("s/%d/%s.txt", i, f)); err != nil {
+				t.Fatalf("stack %d file %s missing", i, f)
+			}
+		}
+	}
+	if landedShared != 1 {
+		t.Fatalf("%d conflicting edits landed, want exactly 1", landedShared)
+	}
+	ids, _ := r.Log(tip, 0, false)
+	if want := 1 + 1 + 2*(n-n/3); len(ids) != want {
+		t.Fatalf("history has %d changesets, want %d", len(ids), want)
+	}
+}
