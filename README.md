@@ -61,23 +61,25 @@ daemon. CPU counts client **and** server. Median of 5 runs; full table in
 | `status` with a filesystem watcher | 26 ms (git's fsmonitor daemon) | **25 ms** (`gft watch`) | tie |
 | Is `main~19000` an ancestor of `main`? | 10 ms (in a full clone) | **5 ms** (no clone) | |
 
-**Storage** (on disk after import; git includes its commit-graph with
-changed-path filters). graft stores objects with write-time deltas and a
-trained dictionary and needs no repacking. git's numbers are after an
-explicit repack (`git repack -adf`) or `gc --aggressive`. graft uses SHA-256
-IDs, so the SHA-256 git columns compare like with like:
+**Storage** (on disk; git includes its commit-graph with changed-path
+filters). graft stores objects with write-time deltas and trained
+dictionaries and never needs repacking. `gft compact` is optional, like
+`git gc --aggressive`: it re-deltas blobs against similar ones anywhere in
+history and retrains the dictionaries. graft uses SHA-256 IDs, so the
+SHA-256 git columns compare like with like:
 
-| repository | graft | git SHA-1 repack | git SHA-1 aggressive | git SHA-256 repack | git SHA-256 aggressive |
-|---|---:|---:|---:|---:|---:|
-| synthetic monorepo, 20k commits | **96.0 MB** | 113.7 MB | 106.2 MB | 122.6 MB | 115.1 MB |
-| redis/redis, 13k commits | **83.8 MB** | 84.1 MB | 80.5 MB | 91.3 MB | 80.9 MB |
-| spf13/cobra, 1.1k commits | **1.47 MB** | 1.60 MB | 1.48 MB | 1.61 MB | 1.49 MB |
+| repository | graft | graft + `gft compact` | git SHA-1 repack | git SHA-1 aggressive | git SHA-256 repack | git SHA-256 aggressive |
+|---|---:|---:|---:|---:|---:|---:|
+| synthetic monorepo, 20k commits | **97.0 MB** | **94.4 MB** | 113.7 MB | 106.2 MB | 122.6 MB | 115.1 MB |
+| redis/redis, 13k commits | **84.0 MB** | **80.3 MB** | 84.1 MB | 80.5 MB | 91.3 MB | 80.9 MB |
+| spf13/cobra, 1.1k commits | **1.49 MB** | **1.38 MB** | 1.60 MB | 1.48 MB | 1.61 MB | 1.49 MB |
 
-That table also holds graft's history indexes: per-path history, the commit
-graph, and rename sources. graft is smaller than git's repack on all three
-repositories (SHA-1 or SHA-256). It is also smaller than `gc --aggressive`
-on cobra and the monorepo. On redis, `gc --aggressive` (an offline,
-minutes-long repack) is 4% smaller.
+graft's numbers include its history indexes (per-path history, the commit
+graph, rename sources). Straight after import, graft is smaller than git's
+repack on all three repositories, SHA-1 or SHA-256, and smaller than
+`gc --aggressive` on the monorepo; on cobra it ties SHA-256 aggressive and
+is 4 KB over SHA-1 aggressive, and on redis aggressive is 4% smaller. After
+`gft compact`, graft is smaller than every git configuration on all three.
 
 **Correctness checks** that run with the benchmarks and tests:
 * every concurrent land is verified present and history linear;
