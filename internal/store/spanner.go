@@ -3,10 +3,17 @@
 package store
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+
 	"context"
 	"encoding/hex"
 	"errors"
+	"golang.org/x/oauth2"
+	"google.golang.org/api/option"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +44,10 @@ type Spanner struct {
 	payloads *MemLRU
 	derived  *MemLRU
 	seqs     atomic.Pointer[map[object.ID]uint64]
+
+	logMu    sync.Mutex
+	logQueue []*logWaiter
+	logBusy  bool
 }
 
 // SpannerSchema is the DDL graft needs.
@@ -61,7 +72,7 @@ func logKey(seq uint64) int64 {
 
 // CreateSpannerSchema creates graft's tables in an existing database.
 func CreateSpannerSchema(ctx context.Context, db string) error {
-	admin, err := database.NewDatabaseAdminClient(ctx)
+	admin, err := database.NewDatabaseAdminClient(ctx, gcpOptions()...)
 	if err != nil {
 		return err
 	}
@@ -78,7 +89,7 @@ func CreateSpannerSchema(ctx context.Context, db string) error {
 // file contents are kept in that bucket, as Scion keeps them in cloud
 // storage, and Spanner holds everything else.
 func OpenSpanner(ctx context.Context, db string, cacheBytes int64, blobs string) (*Spanner, error) {
-	c, err := spanner.NewClient(ctx, db)
+	c, err := spanner.NewClient(ctx, db, gcpOptions()...)
 	if err != nil {
 		return nil, err
 	}
@@ -99,10 +110,71 @@ func blobKey(id object.ID) string { return hex.EncodeToString(id[:keyIDLen]) }
 
 func isBlob(stored []byte) bool { return len(stored) > 0 && object.Kind(stored[0]) == object.KindBlob }
 
+// gcpOptions authenticates with GOOGLE_OAUTH_ACCESS_TOKEN when it is set
+// (a fixed token, for example from gcloud auth print-access-token), with
+// the gcloud CLI's active account (refreshed as tokens expire) when
+// GRAFT_GCLOUD_AUTH=1, and otherwise with application default credentials.
+func gcpOptions() []option.ClientOption {
+	if tok := os.Getenv("GOOGLE_OAUTH_ACCESS_TOKEN"); tok != "" {
+		return []option.ClientOption{option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok}))}
+	}
+	if os.Getenv("GRAFT_GCLOUD_AUTH") == "1" {
+		return []option.ClientOption{option.WithTokenSource(oauth2.ReuseTokenSource(nil, gcloudTokens{}))}
+	}
+	return nil
+}
+
+type gcloudTokens struct{}
+
+func (gcloudTokens) Token() (*oauth2.Token, error) {
+	out, err := exec.Command("gcloud", "auth", "print-access-token").Output()
+	if err != nil {
+		return nil, fmt.Errorf("gcloud auth print-access-token: %w", err)
+	}
+	// gcloud tokens last an hour; refresh well before.
+	return &oauth2.Token{AccessToken: strings.TrimSpace(string(out)), Expiry: time.Now().Add(45 * time.Minute)}, nil
+}
+
+// CreateSpannerDatabase creates a database with graft's schema in an
+// instance ("projects/P/instances/I") and returns its name.
+func CreateSpannerDatabase(ctx context.Context, instance, name string) (string, error) {
+	admin, err := database.NewDatabaseAdminClient(ctx, gcpOptions()...)
+	if err != nil {
+		return "", err
+	}
+	defer admin.Close()
+	op, err := admin.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{Parent: instance,
+		CreateStatement: "CREATE DATABASE `" + name + "`", ExtraStatements: SpannerSchema})
+	if err != nil {
+		return "", err
+	}
+	db, err := op.Wait(ctx)
+	if err != nil {
+		return "", err
+	}
+	return db.Name, nil
+}
+
+// DropSpannerDatabase deletes a database.
+func DropSpannerDatabase(ctx context.Context, db string) error {
+	admin, err := database.NewDatabaseAdminClient(ctx, gcpOptions()...)
+	if err != nil {
+		return err
+	}
+	defer admin.Close()
+	return admin.DropDatabase(ctx, &databasepb.DropDatabaseRequest{Database: db})
+}
+
 func notFound(err error) bool { return spanner.ErrCode(err) == codes.NotFound }
 
 func (s *Spanner) ctx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), time.Minute)
+}
+
+// metaCtx bounds read-write transactions on refs and the log, which can
+// wait behind contending transactions.
+func (s *Spanner) metaCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Minute)
 }
 
 func (s *Spanner) Get(id object.ID) ([]byte, error) {
@@ -256,7 +328,7 @@ func (s *Spanner) GetRef(name string) (object.ID, error) {
 // must be absent (fails if it exists), otherwise a conditional DML update
 // or delete matching the expected value. Each is a single atomic statement.
 func (s *Spanner) CASRef(name string, old, new object.ID) error {
-	ctx, cancel := s.ctx()
+	ctx, cancel := s.metaCtx()
 	defer cancel()
 	mismatch := func() error {
 		cur, err := s.GetRef(name)
@@ -318,27 +390,94 @@ func (s *Spanner) ListRefs() (map[string]object.ID, error) {
 }
 
 // AppendLog assigns the next sequence number transactionally (idempotent).
+// Concurrent appends are group-committed: whoever finds no transaction in
+// flight commits every waiting changeset in one read-write transaction, so
+// appends do not queue one round trip each on the counter row.
 func (s *Spanner) AppendLog(id object.ID) (uint64, error) {
+	seqs, err := s.AppendLogs([]object.ID{id})
+	if err != nil {
+		return 0, err
+	}
+	return seqs[0], nil
+}
+
+type logWaiter struct {
+	ids  []object.ID
+	seqs []uint64
+	err  error
+	done chan struct{}
+}
+
+// AppendLogs appends changesets in order (one transaction per group of
+// concurrent callers).
+func (s *Spanner) AppendLogs(ids []object.ID) ([]uint64, error) {
+	w := &logWaiter{ids: ids, done: make(chan struct{})}
+	s.logMu.Lock()
+	s.logQueue = append(s.logQueue, w)
+	lead := !s.logBusy
+	s.logBusy = true
+	s.logMu.Unlock()
+	if lead {
+		for {
+			s.logMu.Lock()
+			group := s.logQueue
+			s.logQueue = nil
+			if len(group) == 0 {
+				s.logBusy = false
+				s.logMu.Unlock()
+				break
+			}
+			s.logMu.Unlock()
+			var all []object.ID
+			for _, g := range group {
+				all = append(all, g.ids...)
+			}
+			seqs, err := s.appendLogsTxn(all)
+			for _, g := range group {
+				g.err = err
+				if err == nil {
+					g.seqs, seqs = seqs[:len(g.ids)], seqs[len(g.ids):]
+				}
+				close(g.done)
+			}
+		}
+	}
+	<-w.done
+	return w.seqs, w.err
+}
+
+func (s *Spanner) appendLogsTxn(ids []object.ID) ([]uint64, error) {
 	for {
-		seq, err := s.appendLog(id)
-		// A concurrent append that took the same sequence surfaces as a
-		// conflict on insert; Spanner normally aborts and retries the
-		// transaction itself, but retry here too.
+		seqs, err := s.appendLogsOnce(ids)
+		// Spanner aborts and retries conflicting transactions itself; a
+		// conflict that surfaces on insert is retried here too.
 		if spanner.ErrCode(err) == codes.AlreadyExists {
 			continue
 		}
-		return seq, err
+		return seqs, err
 	}
 }
 
-func (s *Spanner) appendLog(id object.ID) (uint64, error) {
-	ctx, cancel := s.ctx()
+func (s *Spanner) appendLogsOnce(ids []object.ID) ([]uint64, error) {
+	ctx, cancel := s.metaCtx()
 	defer cancel()
-	var seq int64
+	seqs := make([]uint64, len(ids))
 	_, err := s.c.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		if row, err := tx.ReadRow(ctx, "LogIdx", spanner.Key{id[:keyIDLen]}, []string{"Seq"}); err == nil {
-			return row.Columns(&seq)
-		} else if !notFound(err) {
+		keys := spanner.KeySets()
+		for _, id := range ids {
+			keys = spanner.KeySets(keys, spanner.Key{id[:keyIDLen]})
+		}
+		known := map[string]int64{}
+		err := tx.Read(ctx, "LogIdx", keys, []string{"Id", "Seq"}).Do(func(r *spanner.Row) error {
+			var k []byte
+			var seq int64
+			if err := r.Columns(&k, &seq); err != nil {
+				return err
+			}
+			known[string(k)] = seq
+			return nil
+		})
+		if err != nil {
 			return err
 		}
 		var last int64
@@ -349,14 +488,27 @@ func (s *Spanner) appendLog(id object.ID) (uint64, error) {
 		} else if !notFound(err) {
 			return err
 		}
-		seq = last + 1
-		return tx.BufferWrite([]*spanner.Mutation{
-			spanner.InsertOrUpdate("Counters", []string{"Name", "Value"}, []any{"log", seq}),
-			spanner.Insert("Log", []string{"Key", "Seq", "Id"}, []any{logKey(uint64(seq)), seq, id[:]}),
-			spanner.Insert("LogIdx", []string{"Id", "Seq"}, []any{id[:keyIDLen], seq}),
-		})
+		var muts []*spanner.Mutation
+		for i, id := range ids {
+			k := string(id[:keyIDLen])
+			if seq, ok := known[k]; ok {
+				seqs[i] = uint64(seq)
+				continue
+			}
+			last++
+			known[k] = last
+			seqs[i] = uint64(last)
+			muts = append(muts,
+				spanner.Insert("Log", []string{"Key", "Seq", "Id"}, []any{logKey(uint64(last)), last, id[:]}),
+				spanner.Insert("LogIdx", []string{"Id", "Seq"}, []any{id[:keyIDLen], last}))
+		}
+		if len(muts) == 0 {
+			return nil
+		}
+		muts = append(muts, spanner.InsertOrUpdate("Counters", []string{"Name", "Value"}, []any{"log", last}))
+		return tx.BufferWrite(muts)
 	})
-	return uint64(seq), err
+	return seqs, err
 }
 
 func (s *Spanner) LogSeq(id object.ID) (uint64, error) {

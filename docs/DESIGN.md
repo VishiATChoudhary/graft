@@ -292,9 +292,15 @@ renames are followed. Server-side merges use diff3.
   (`gs://`, `s3://`, `file://`): trees, changesets and derived data are
   rows, ref CAS is a single conditional
   statement, log sequences are assigned in read-write transactions, and
-  Spanner provides replication, failover and scaling. CI runs the full
-  repository suite against it (in-memory `spannertest`); it has not been run
-  against a production Spanner instance. Spanner rows hold each object's
+  Spanner provides replication, failover and scaling. Log appends from
+  concurrent requests are group-committed into one read-write transaction.
+  CI runs the full repository suite against the in-memory `spannertest`
+  server; on 2026-10-14 it was also run against a real Cloud Spanner
+  instance (regional-us-west1, 100 processing units, a fresh database per
+  test: `GRAFT_TEST_SPANNER=1 GRAFT_SPANNER_INSTANCE=projects/P/instances/I
+  go test -tags cloud ./internal/repo/`), with an end-to-end `gft serve
+  --spanner --blobs` smoke test (write, land, change request through the
+  merge queue, log, grep, clone). Spanner rows hold each object's
   standard compressed form, without graft's delta encodings, so the dense
   storage numbers apply to the pebble backends. Self-hosted alternative:
   pebble shards replicated by graft itself (majority writes, Raft for refs
