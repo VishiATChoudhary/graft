@@ -302,9 +302,10 @@ renames are followed. Server-side merges use diff3.
   run from a VM in the same region (two tests that need a local store
   skip), plus an end-to-end `gft serve --spanner --blobs` smoke test
   (write, land, change request through the merge queue, log, grep,
-  clone). Spanner rows hold each object's
-  standard compressed form, without graft's delta encodings, so the dense
-  storage numbers apply to the pebble backends. Self-hosted alternative:
+  clone). New versions are stored as zstd-compressed deltas against
+  the previous version when smaller (chains capped at 32), in rows or in
+  the bucket alike; the trained dictionaries and optional compaction remain
+  specific to the pebble store. Self-hosted alternative:
   pebble shards replicated by graft itself (majority writes, Raft for refs
   and the log), without automatic re-replication to new machines.
 * **Code review** is graft's own: change requests with revisions, line

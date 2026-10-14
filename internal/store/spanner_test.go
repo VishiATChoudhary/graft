@@ -3,6 +3,8 @@
 package store
 
 import (
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,5 +49,60 @@ func TestSpannerBlobsInBucket(t *testing.T) {
 		if _, _, err := object.Verify(id, b); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestSpannerDeltas checks versions are stored as deltas when smaller and
+// read back exactly with cold caches, through a chain.
+func TestSpannerDeltas(t *testing.T) {
+	for _, blobs := range []bool{false, true} {
+		url := ""
+		if blobs {
+			dir := filepath.ToSlash(t.TempDir())
+			if !strings.HasPrefix(dir, "/") {
+				dir = "/" + dir
+			}
+			url = "file://" + dir
+		}
+		s, closeFn, err := OpenFakeSpanner(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rng := rand.New(rand.NewSource(1))
+		var sb strings.Builder
+		for i := 0; i < 400; i++ {
+			fmt.Fprintf(&sb, "func f%d(x int) int { return x*%d + %d }\n", rng.Intn(1e6), rng.Intn(1e6), rng.Intn(1e6))
+		}
+		content := []byte(sb.String())
+		var ids []object.ID
+		prev := object.Zero
+		for v := 0; v < 40; v++ {
+			content = append(content, []byte("version line "+strings.Repeat("x", v)+"\n")...)
+			id, stored := object.Encode(object.KindBlob, content)
+			if err := s.PutBase(id, stored, prev); err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, id)
+			prev = id
+		}
+		rec, err := s.record(ids[len(ids)-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, full := object.Encode(object.KindBlob, content)
+		if !isDeltaRec(rec) || len(rec) >= len(full)/4 {
+			t.Fatalf("last version not stored as a small delta: %d bytes vs %d full", len(rec), len(full))
+		}
+		s.hot, s.payloads = NewMemLRU(1), NewMemLRU(1) // cold reads
+		for _, id := range ids {
+			b, err := s.Get(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := object.Verify(id, b); err != nil {
+				t.Fatalf("version %s: %v", id.Short(), err)
+			}
+		}
+		closeFn()
 	}
 }

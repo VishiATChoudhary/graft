@@ -181,6 +181,26 @@ func (s *Spanner) Get(id object.ID) ([]byte, error) {
 	if b, err := s.hot.Get(id); err == nil {
 		return b, nil
 	}
+	rec, err := s.record(id)
+	if err != nil {
+		return nil, err
+	}
+	if !isDeltaRec(rec) {
+		s.hot.Put(id, rec)
+		return rec, nil
+	}
+	k, p, err := s.Payload(id)
+	if err != nil {
+		return nil, err
+	}
+	_, stored := object.Encode(k, p)
+	s.hot.Put(id, stored)
+	return stored, nil
+}
+
+// record fetches an object's stored record: a Spanner row, or for file
+// contents in a bucket, the bucket object.
+func (s *Spanner) record(id object.ID) ([]byte, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 	row, err := s.c.Single().ReadRow(ctx, "Objects", spanner.Key{id[:keyIDLen]}, []string{"Data"})
@@ -189,11 +209,7 @@ func (s *Spanner) Get(id object.ID) ([]byte, error) {
 		if gcerrors.Code(err) == gcerrors.NotFound {
 			return nil, object.ErrNotFound
 		}
-		if err != nil {
-			return nil, err
-		}
-		s.hot.Put(id, b)
-		return b, nil
+		return b, err
 	}
 	if notFound(err) {
 		return nil, object.ErrNotFound
@@ -202,18 +218,36 @@ func (s *Spanner) Get(id object.ID) ([]byte, error) {
 		return nil, err
 	}
 	var b []byte
-	if err := row.Columns(&b); err != nil {
-		return nil, err
+	return b, row.Columns(&b)
+}
+
+// Delta records. PutBase stores an object as a zstd-compressed delta
+// against a previous version when that is smaller, as the pebble store
+// does: [kind][spannerDelta][depth][base ID][uvarint size][zstd delta].
+// Chains are capped at maxSpannerDepth so a read costs a bounded number of
+// row reads (each decoded version is cached).
+const (
+	spannerDelta    = 0xD0
+	maxSpannerDepth = 32
+)
+
+func isDeltaRec(rec []byte) bool { return len(rec) > 3+len(object.Zero) && rec[1] == spannerDelta }
+
+func (s *Spanner) writeRecord(id object.ID, rec []byte) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+	if s.bucket != nil && isBlob(rec) {
+		return s.bucket.WriteAll(ctx, blobKey(id), rec, nil)
 	}
-	s.hot.Put(id, b)
-	return b, nil
+	_, err := s.c.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("Objects", []string{"Id", "Data"}, []any{id[:keyIDLen], rec})})
+	return err
 }
 
 func (s *Spanner) Has(id object.ID) (bool, error) {
 	if ok, _ := s.hot.Has(id); ok {
 		return true, nil
 	}
-	_, err := s.Get(id)
+	_, err := s.record(id)
 	if errors.Is(err, object.ErrNotFound) {
 		return false, nil
 	}
@@ -237,8 +271,48 @@ func (s *Spanner) Put(id object.ID, stored []byte) error {
 	return err
 }
 
-// PutBase stores the standard form; Spanner storage is not delta-encoded.
-func (s *Spanner) PutBase(id object.ID, stored []byte, _ object.ID) error { return s.Put(id, stored) }
+// PutBase stores id as a delta against base when that is smaller.
+func (s *Spanner) PutBase(id object.ID, stored []byte, base object.ID) error {
+	if base.IsZero() || base == id {
+		return s.Put(id, stored)
+	}
+	rec, ok := s.deltaRecord(stored, base)
+	if !ok {
+		return s.Put(id, stored)
+	}
+	if err := s.writeRecord(id, rec); err != nil {
+		return err
+	}
+	s.hot.Put(id, stored)
+	return nil
+}
+
+func (s *Spanner) deltaRecord(stored []byte, base object.ID) ([]byte, bool) {
+	k, target, err := object.Unpack(stored)
+	if err != nil {
+		return nil, false
+	}
+	bk, bp, err := s.Payload(base)
+	if err != nil || bk != k {
+		return nil, false
+	}
+	depth := byte(1)
+	if brec, err := s.record(base); err == nil && isDeltaRec(brec) {
+		if brec[2] >= maxSpannerDepth {
+			return nil, false
+		}
+		depth = brec[2] + 1
+	}
+	d := MakeDelta(bp, target)
+	var e object.Encoder
+	e.Byte(byte(k))
+	e.Byte(spannerDelta)
+	e.Byte(depth)
+	e.ID(base)
+	e.Uvarint(uint64(len(target)))
+	rec := bigEnc.EncodeAll(d, e.B)
+	return rec, len(rec) < len(stored)
+}
 
 func (s *Spanner) Deltify(object.ID, object.ID) error { return nil }
 
@@ -246,23 +320,60 @@ func (s *Spanner) Payload(id object.ID) (object.Kind, []byte, error) {
 	if v, err := s.payloads.Get(id); err == nil {
 		return object.Kind(v[0]), v[1:], nil
 	}
-	b, err := s.Get(id)
+	if b, err := s.hot.Get(id); err == nil {
+		k, p, err := object.Unpack(b)
+		if err == nil {
+			s.payloads.Put(id, append([]byte{byte(k)}, p...))
+		}
+		return k, p, err
+	}
+	rec, err := s.record(id)
 	if err != nil {
 		return 0, nil, err
 	}
-	k, p, err := object.Unpack(b)
-	if err == nil {
-		s.payloads.Put(id, append([]byte{byte(k)}, p...))
+	var k object.Kind
+	var p []byte
+	if isDeltaRec(rec) {
+		d := object.Decoder{B: rec[3:]}
+		base := d.ID()
+		size := d.Uvarint()
+		if d.Err != nil {
+			return 0, nil, object.ErrCorrupt
+		}
+		bk, bp, err := s.Payload(base)
+		if err != nil {
+			return 0, nil, fmt.Errorf("delta base %s of %s: %w", base.Short(), id.Short(), err)
+		}
+		delta, err := plainDec.DecodeAll(d.B, nil)
+		if err != nil {
+			return 0, nil, fmt.Errorf("%w: %v", object.ErrCorrupt, err)
+		}
+		if p, err = ApplyDelta(bp, delta, size); err != nil {
+			return 0, nil, err
+		}
+		k = bk
+	} else if k, p, err = object.Unpack(rec); err != nil {
+		return 0, nil, err
 	}
-	return k, p, err
+	s.payloads.Put(id, append([]byte{byte(k)}, p...))
+	return k, p, nil
 }
 
 func (s *Spanner) PayloadSize(id object.ID) (uint64, error) {
-	b, err := s.Get(id)
+	if b, err := s.hot.Get(id); err == nil {
+		return object.PayloadSize(b)
+	}
+	rec, err := s.record(id)
 	if err != nil {
 		return 0, err
 	}
-	return object.PayloadSize(b)
+	if isDeltaRec(rec) {
+		d := object.Decoder{B: rec[3:]}
+		d.ID()
+		n := d.Uvarint()
+		return n, d.Err
+	}
+	return object.PayloadSize(rec)
 }
 
 func derivedCacheKey(kind string, id object.ID) object.ID {
