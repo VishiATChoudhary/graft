@@ -128,6 +128,11 @@ func (r *Repo) versionContent(path string, link uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The version was written by changeset cs, whose changes (relative to
+	// its first parent) carry the blob directly: no tree walk needed.
+	if blob, ok := r.changedBlob(cs, path); ok {
+		return r.ReadBlob(blob)
+	}
 	root, err := r.RootTree(cs)
 	if err != nil {
 		return nil, err
@@ -229,4 +234,39 @@ func (r *Repo) Blame(rev object.ID, path string) ([]BlameLine, error) {
 		out = append(out, BlameLine{id, l.orig + 1})
 	}
 	return out, nil
+}
+
+// changedBlob returns the blob changeset cs wrote at path. Large
+// changesets (an import's first commit lists every file) are indexed once
+// and kept, since every file's oldest version points at them.
+func (r *Repo) changedBlob(cs object.ID, path string) (object.ID, bool) {
+	if v, ok := r.bigChanges.Load(cs); ok {
+		id, ok := v.(map[string]object.ID)[path]
+		return id, ok
+	}
+	c, err := r.Changeset(cs)
+	if err != nil {
+		return object.Zero, false
+	}
+	if len(c.Changes) > 256 {
+		m := make(map[string]object.ID, len(c.Changes))
+		for _, ch := range c.Changes {
+			if ch.Mode == object.ModeFile || ch.Mode == object.ModeExec {
+				m[ch.Path] = ch.Blob
+			}
+		}
+		if r.nbig.Add(1) > 64 { // bounded: drop all and start again
+			r.bigChanges.Range(func(k, _ any) bool { r.bigChanges.Delete(k); return true })
+			r.nbig.Store(0)
+		}
+		r.bigChanges.Store(cs, m)
+		id, ok := m[path]
+		return id, ok
+	}
+	for _, ch := range c.Changes {
+		if ch.Path == path && (ch.Mode == object.ModeFile || ch.Mode == object.ModeExec) {
+			return ch.Blob, true
+		}
+	}
+	return object.Zero, false
 }

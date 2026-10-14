@@ -27,6 +27,10 @@ import (
 	"github.com/VishiATChoudhary/graft/internal/store"
 )
 
+// openSpanner is set when gft is built with the cloud tag (cloud.go), so
+// the everyday client binary does not load cloud SDKs at every start.
+var openSpanner func(ctx context.Context, db string, mem int64, blobs string, init bool) (store.Backend, error)
+
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	tier := fs.String("tier", "server", "server | cache | daemon | store")
@@ -60,13 +64,10 @@ func cmdServe(args []string) error {
 		switch {
 		case *spannerDB != "":
 			// Stateless API server on Spanner, as in Scion; run as many as needed.
-			ctx := context.Background()
-			if *spannerInit {
-				if err := store.CreateSpannerSchema(ctx, *spannerDB); err != nil {
-					return err
-				}
+			if openSpanner == nil {
+				return errors.New("this gft was built without cloud backends; build with: go build -tags cloud ./cmd/gft")
 			}
-			sp, err := store.OpenSpanner(ctx, *spannerDB, mustSize(*mem), *blobsURL)
+			sp, err := openSpanner(context.Background(), *spannerDB, mustSize(*mem), *blobsURL, *spannerInit)
 			if err != nil {
 				return err
 			}

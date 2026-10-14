@@ -28,11 +28,13 @@ jobs:
         run: GRAFT_TEST_SHARDS=3 go test -race ./internal/repo/
       - name: repository tests against Cloud Spanner (in-memory spannertest)
         if: runner.os != 'Windows'
-        run: GRAFT_TEST_SPANNER=1 go test -race ./internal/repo/
+        run: GRAFT_TEST_SPANNER=1 go test -race -tags cloud ./internal/repo/ ./internal/store/
       - name: repository tests against Spanner with file contents in a bucket
         if: runner.os != 'Windows'
-        run: GRAFT_TEST_SPANNER=blobs go test -race ./internal/repo/
+        run: GRAFT_TEST_SPANNER=blobs go test -race -tags cloud ./internal/repo/
       - run: go build -o bin/gft ./cmd/gft
+      - name: build with cloud backends
+        run: go build -tags cloud -o bin/gft-cloud ./cmd/gft
       - name: smoke test against git
         if: runner.os != 'Windows'
         run: bench/smoke.sh

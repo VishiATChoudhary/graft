@@ -114,7 +114,12 @@ class Bench:
         self.giturl = "file://" + self.git
         self.work = tempfile.mkdtemp(prefix="gftbench-")
         self.results = []
-        self.tiers = Tiers(os.path.abspath(args.gft), self.work)
+        # Serve a fresh copy of the store, so derived data computed by an
+        # earlier run (blame, search filters) never counts as first-time.
+        data = os.path.join(self.work, "server.gft")
+        shutil.rmtree(data, ignore_errors=True)
+        shutil.copytree(os.path.abspath(args.gft), data)
+        self.tiers = Tiers(data, self.work)
         hot = open(os.path.join(self.git, "hot_files.txt")).read().split()
         self.hot = hot[0]
         self.reps = args.reps

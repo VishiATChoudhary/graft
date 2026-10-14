@@ -29,9 +29,11 @@ type Repo struct {
 	// subtrees).
 	OnCreate func(id object.ID)
 
-	landers   sync.Map      // ref -> *lander (coalesced lands)
-	rootHints sync.Map      // changeset -> root tree, for rebases not yet logged
-	blooms    *store.MemLRU // tree -> search filter (trigram.go)
+	landers    sync.Map      // ref -> *lander (coalesced lands)
+	rootHints  sync.Map      // changeset -> root tree, for rebases not yet logged
+	blooms     *store.MemLRU // tree -> search filter (trigram.go)
+	bigChanges sync.Map      // large changeset -> path -> blob (blame.go)
+	nbig       atomic.Int64
 
 	cs *derive.Type // changeset -> root tree, history root, commit graph (one record)
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,26 +25,19 @@ func newRepo(t *testing.T) *Repo {
 
 // newBackend returns a local DB, or a sharded fleet when GRAFT_TEST_SHARDS
 // is set (CI runs the suite both ways).
+// spannerBackend is set in builds with the cloud tag (spanner_cloud_test.go).
+var spannerBackend func(t *testing.T, blobs bool) store.Backend
+
 func newBackend(t *testing.T) store.Backend {
 	t.Helper()
 	if n, _ := strconv.Atoi(os.Getenv("GRAFT_TEST_SHARDS")); n > 0 {
 		return newFleet(t, n)
 	}
 	if mode := os.Getenv("GRAFT_TEST_SPANNER"); mode != "" {
-		blobs := ""
-		if mode == "blobs" { // file contents in a bucket, as with cloud storage
-			dir := filepath.ToSlash(t.TempDir())
-			if !strings.HasPrefix(dir, "/") {
-				dir = "/" + dir // file:///C:/...
-			}
-			blobs = "file://" + dir
+		if spannerBackend == nil {
+			t.Skip("GRAFT_TEST_SPANNER needs -tags cloud")
 		}
-		s, closeFn, err := store.OpenFakeSpanner(blobs)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(closeFn)
-		return s
+		return spannerBackend(t, mode == "blobs")
 	}
 	db, err := store.OpenDB(t.TempDir(), 64<<20)
 	if err != nil {

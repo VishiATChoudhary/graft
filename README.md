@@ -48,18 +48,20 @@ daemon. CPU counts client **and** server. Median of 5 runs; full table in
 
 | workload | git | graft | |
 |---|---:|---:|---|
-| Sparse checkout, 1 package of 100k files | 308 ms (`--depth 1 --filter=blob:none --sparse`, best case) | **25 ms** | 12x |
-| Virtual checkout + read 1 package | (needs a clone) | **86 ms** | |
-| Full checkout, 100k files | 9.0 s (`--depth 1`) | **4.7 s**, less CPU | 1.9x |
-| Move a working copy forward 100 commits | 148 ms, 603 ms CPU | **52 ms, 78 ms CPU** | 2.8x, 8x less CPU |
-| 16 agents x 8 concurrent lands | 4.0 lands/s, 417 push retries, 195 s CPU | **244 lands/s**, 3.1 s CPU | **61x throughput, 63x less CPU** |
-| 128 agents x 8 lands, one load generator | | **4,900 lands/s** one server; 2,500 on 3 API servers + 3 shards | |
-| Search all 100k files (fixed string) | 2.1 s `git grep` (in a full clone) | **64 ms** (server-side, no clone) | 32x |
-| Log of one file | 54 ms (in a full clone) | **9 ms** (no clone) | 6x |
-| Blame of a hot file | 91 ms (in a full clone) | **8 ms** memoized, 108 ms first time (no clone) | |
-| `status`, clean 100k-file working copy | 147 ms | **99 ms** | |
-| `status` with a filesystem watcher | 26 ms (git's fsmonitor daemon) | **25 ms** (`gft watch`) | tie |
-| Is `main~19000` an ancestor of `main`? | 10 ms (in a full clone) | **5 ms** (no clone) | |
+| Sparse checkout, 1 package of 100k files | 315 ms (`--depth 1 --filter=blob:none --sparse`, best case) | **26 ms** | 12x |
+| Virtual checkout + read 1 package | (needs a clone) | **93 ms** | |
+| Full checkout, 100k files | 8.8 s (`--depth 1`) | **4.7 s**, less CPU | 1.9x |
+| Move a working copy forward 100 commits | 149 ms, 576 ms CPU | **50 ms, 78 ms CPU** | 3x, 7x less CPU |
+| 16 agents x 8 concurrent lands | 3.2 lands/s, 455 push retries, 223 s CPU | **264 lands/s**, 2.3 s CPU | **82x throughput, 97x less CPU** |
+| 128 agents x 8 lands, one load generator | | **4,500 lands/s** one server; 3,800 on 3 API servers + 3 shards | |
+| Search all 100k files (fixed string) | 2.1 s `git grep` (in a full clone) | **73 ms** (server-side, no clone) | 29x |
+| Log of one file | 54 ms (in a full clone) | **8.5 ms** (no clone) | 6x |
+| Last 50 commits under a directory | 10.1 ms (in a full clone) | **5.8 ms** (no clone) | |
+| Blame of a hot file | 92 ms (in a full clone) | **81 ms** first time, **8 ms** memoized (no clone) | |
+| `status`, clean 100k-file working copy | 136 ms | **99 ms** | |
+| `status` with a filesystem watcher | 26.6 ms (git's fsmonitor daemon) | **24.7 ms** (`gft watch`) | |
+| Is `main~19000` an ancestor of `main`? | 10.9 ms (in a full clone) | **6.7 ms** (no clone) | |
+| Files changed under a directory over 5000 commits | 10.8 ms (in a full clone) | **6.2 ms** (no clone) | |
 
 **Storage** (on disk; git includes its commit-graph with changed-path
 filters). graft stores objects with write-time deltas and trained
@@ -154,7 +156,9 @@ gft import --store $NODES --git ~/src/myrepo
 ```
 
 On Google Cloud, point API servers at Spanner instead, the backend Scion
-uses, with file contents in cloud storage (`--blobs`: `gs://`, `s3://` or
+uses (build with `go build -tags cloud ./cmd/gft`; the everyday binary
+leaves the cloud SDKs out so it starts in about 5 ms), with file contents
+in cloud storage (`--blobs`: `gs://`, `s3://` or
 `file://`; `--spanner-init` creates the tables once):
 
 ```sh
