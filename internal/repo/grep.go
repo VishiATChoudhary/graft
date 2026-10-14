@@ -28,12 +28,14 @@ type GrepOptions struct {
 	Prefix     string                 // only paths under this directory
 	Limit      int                    // maximum matches (0: 1000)
 	CanRead    func(path string) bool // access filter (nil: all)
+	NoIndex    bool                   // scan every file (for testing the index)
 }
 
-// Grep searches file contents of a revision on the server: blobs come from
-// the server's caches, files are scanned in parallel, and the whole blob is
-// tested before it is split into lines, so non-matching files cost one
-// pass. No clone or index is needed.
+// Grep searches file contents of a revision on the server. Directories
+// whose search filter (trigram.go) shows they cannot contain the pattern's
+// required text are skipped; the remaining files are scanned in parallel,
+// each tested whole before being split into lines. Results are exactly
+// those of a full scan.
 func (r *Repo) Grep(root object.ID, opt GrepOptions) ([]GrepMatch, bool, error) {
 	if opt.Limit <= 0 {
 		opt.Limit = 1000
@@ -57,30 +59,39 @@ func (r *Repo) Grep(root object.ID, opt GrepOptions) ([]GrepMatch, bool, error) 
 		path string
 		id   object.ID
 	}
+	type dir struct {
+		tree  object.ID
+		files []file
+	}
+	var dirs []dir
 	var files []file
 	start, err := r.Lookup(root, opt.Prefix)
 	if err != nil {
 		return nil, false, err
 	}
-	var walk func(dir string, id object.ID) error
-	walk = func(dir string, id object.ID) error {
-		if opt.CanRead != nil && dir != "" && !opt.CanRead(dir) {
+	var walk func(path string, id object.ID) error
+	walk = func(path string, id object.ID) error {
+		if opt.CanRead != nil && path != "" && !opt.CanRead(path) {
 			return nil
 		}
 		t, err := store.ReadTree(r.DB, id)
 		if err != nil {
 			return err
 		}
+		d := dir{tree: id}
 		for _, e := range t.Entries {
-			p := join(dir, e.Name)
+			p := join(path, e.Name)
 			switch e.Mode {
 			case object.ModeDir:
 				if err := walk(p, e.ID); err != nil {
 					return err
 				}
 			case object.ModeFile, object.ModeExec:
-				files = append(files, file{p, e.ID})
+				d.files = append(d.files, file{p, e.ID})
 			}
+		}
+		if len(d.files) > 0 {
+			dirs = append(dirs, d)
 		}
 		return nil
 	}
@@ -92,6 +103,51 @@ func (r *Repo) Grep(root object.ID, opt GrepOptions) ([]GrepMatch, bool, error) 
 		}
 	case start.Mode == object.ModeFile || start.Mode == object.ModeExec:
 		files = append(files, file{prefix, start.ID})
+	}
+	// Use the directory filters when the pattern requires some text.
+	if tris := queryTrigrams(requiredLiterals(opt.Pattern, opt.Fixed)); len(tris) > 0 && !opt.NoIndex {
+		keep := make([]bool, len(dirs))
+		var werr error
+		var emu sync.Mutex
+		var wg sync.WaitGroup
+		next := make(chan int, len(dirs))
+		for i := range dirs {
+			next <- i
+		}
+		close(next)
+		for w := 0; w < runtime.GOMAXPROCS(0); w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range next {
+					ids := make([]object.ID, len(dirs[i].files))
+					for j, f := range dirs[i].files {
+						ids[j] = f.id
+					}
+					b, err := r.dirBloom(dirs[i].tree, ids)
+					if err != nil {
+						emu.Lock()
+						werr = err
+						emu.Unlock()
+						continue
+					}
+					keep[i] = b.mayContain(tris)
+				}
+			}()
+		}
+		wg.Wait()
+		if werr != nil {
+			return nil, false, werr
+		}
+		for i, d := range dirs {
+			if keep[i] {
+				files = append(files, d.files...)
+			}
+		}
+	} else {
+		for _, d := range dirs {
+			files = append(files, d.files...)
+		}
 	}
 
 	var (

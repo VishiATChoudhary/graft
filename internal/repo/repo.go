@@ -29,8 +29,9 @@ type Repo struct {
 	// subtrees).
 	OnCreate func(id object.ID)
 
-	landers   sync.Map // ref -> *lander (coalesced lands)
-	rootHints sync.Map // changeset -> root tree, for rebases not yet logged
+	landers   sync.Map      // ref -> *lander (coalesced lands)
+	rootHints sync.Map      // changeset -> root tree, for rebases not yet logged
+	blooms    *store.MemLRU // tree -> search filter (trigram.go)
 
 	cs *derive.Type // changeset -> root tree, history root, commit graph (one record)
 
@@ -51,7 +52,7 @@ var (
 
 // Open opens a repository over an existing DB.
 func Open(db store.Backend) (*Repo, error) {
-	r := &Repo{DB: db, eng: derive.NewEngine(db), unodes: store.NewMemLRU(64 << 20)}
+	r := &Repo{DB: db, eng: derive.NewEngine(db), unodes: store.NewMemLRU(64 << 20), blooms: store.NewMemLRU(256 << 20)}
 	csParents := func(id object.ID) ([]object.ID, error) {
 		cs, err := r.Changeset(id)
 		if err != nil {

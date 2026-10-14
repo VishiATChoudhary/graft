@@ -205,6 +205,23 @@ against a 3-shard fleet, land concurrently through three API servers, and
 kill the Raft leader and a data replica mid-workload (two shards x three
 replicas) checking that landing continues and nothing is lost.
 
+## Code search (`internal/repo/grep.go`, `trigram.go`)
+
+Each directory version (tree ID) has a Bloom filter of the trigrams of the
+files directly in it, lowercased so it also serves case-insensitive
+searches (16 bits per distinct trigram, three hashes: about 0.1% false
+positives per trigram). It is derived data keyed by the tree ID, computed
+the first time a search reaches the directory; trees are content-addressed,
+so a new revision only needs filters for directories it changed. A search
+extracts the literal text every match must contain (the string itself for
+fixed searches; literal runs that a regular expression requires, not
+through alternations or optional parts), skips directories whose filter
+lacks any of its trigrams, and scans the rest in parallel. Filters have no
+false negatives and directories with files too large to index are never
+skipped, so results equal a full scan (tested). On the 100k-file monorepo
+selective searches take 11 to 24 ms against about 400 ms for a full scan;
+the filters for a whole revision take about 4% of the repository's size.
+
 ## Change requests and the merge queue (`internal/api/cr.go`)
 
 A change request's record (title, author, target ref, revisions, comments,
@@ -278,7 +295,8 @@ renames are followed. Server-side merges use diff3.
 * **Code review** is graft's own: change requests with revisions, line
   comments, semantic approval rules and a merge queue that lands approved
   requests, with a web UI; Antique's details beyond what the post says are
-  not public. **Code search** is an unindexed parallel scan.
+  not public. **Code search** is graft's own design (the post gives none):
+  per-directory trigram filters as derived data, see below.
 * **Storage efficiency** is decided at write time; nothing ever needs
   repacking. `gft compact` is an optional pass (like `git gc --aggressive`)
   that re-deltas blobs against similar ones anywhere in history.

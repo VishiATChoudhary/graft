@@ -244,7 +244,7 @@ Everything the CLI does is an API call to the server (`internal/api`):
 | `GET /v1/log?rev=&path=&limit=&follow=&first_parent=` | history |
 | `GET /v1/blame?rev=&path=` | blame with authors and line text |
 | `GET /v1/diff?from=&to=&mergebase=&path=&patch=` | file changes or a unified patch |
-| `GET /v1/grep?rev=&q=&path=&fixed=&i=` | content search |
+| `GET /v1/grep?rev=&q=&path=&fixed=&i=` | content search (indexed by per-directory trigram filters) |
 | `GET /v1/mergebase?a=&b=`, `/v1/isancestor` | ancestry |
 | `GET /v1/crs?state=`, `/v1/cr?id=`; `POST /v1/cr/{create,revise,comment,queue,close}` | change requests and the merge queue |
 | `GET /review` | review web UI |
