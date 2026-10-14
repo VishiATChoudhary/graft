@@ -29,6 +29,9 @@ jobs:
       - name: repository tests against Cloud Spanner (in-memory spannertest)
         if: runner.os != 'Windows'
         run: GRAFT_TEST_SPANNER=1 go test -race ./internal/repo/
+      - name: repository tests against Spanner with file contents in a bucket
+        if: runner.os != 'Windows'
+        run: GRAFT_TEST_SPANNER=blobs go test -race ./internal/repo/
       - run: go build -o bin/gft ./cmd/gft
       - name: smoke test against git
         if: runner.os != 'Windows'

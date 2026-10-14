@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -10,6 +11,11 @@ import (
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	databasepb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	"gocloud.dev/blob"
+	_ "gocloud.dev/blob/fileblob"
+	_ "gocloud.dev/blob/gcsblob"
+	_ "gocloud.dev/blob/s3blob"
+	"gocloud.dev/gcerrors"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 
@@ -24,6 +30,7 @@ import (
 // scaling; API servers stay stateless caches in front of it.
 type Spanner struct {
 	c        *spanner.Client
+	bucket   *blob.Bucket // file contents, if set (cloud storage)
 	hot      *MemLRU
 	payloads *MemLRU
 	derived  *MemLRU
@@ -65,7 +72,10 @@ func CreateSpannerSchema(ctx context.Context, db string) error {
 }
 
 // OpenSpanner connects to a database ("projects/P/instances/I/databases/D").
-func OpenSpanner(ctx context.Context, db string, cacheBytes int64) (*Spanner, error) {
+// If blobs is set (a bucket URL: gs://bucket, s3://bucket, file:///dir),
+// file contents are kept in that bucket, as Scion keeps them in cloud
+// storage, and Spanner holds everything else.
+func OpenSpanner(ctx context.Context, db string, cacheBytes int64, blobs string) (*Spanner, error) {
 	c, err := spanner.NewClient(ctx, db)
 	if err != nil {
 		return nil, err
@@ -73,8 +83,19 @@ func OpenSpanner(ctx context.Context, db string, cacheBytes int64) (*Spanner, er
 	if cacheBytes <= 0 {
 		cacheBytes = 1 << 30
 	}
-	return &Spanner{c: c, hot: NewMemLRU(cacheBytes / 2), payloads: NewMemLRU(cacheBytes / 4), derived: NewMemLRU(cacheBytes / 4)}, nil
+	s := &Spanner{c: c, hot: NewMemLRU(cacheBytes / 2), payloads: NewMemLRU(cacheBytes / 4), derived: NewMemLRU(cacheBytes / 4)}
+	if blobs != "" {
+		if s.bucket, err = blob.OpenBucket(ctx, blobs); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
+	return s, nil
 }
+
+func blobKey(id object.ID) string { return hex.EncodeToString(id[:keyIDLen]) }
+
+func isBlob(stored []byte) bool { return len(stored) > 0 && object.Kind(stored[0]) == object.KindBlob }
 
 func notFound(err error) bool { return spanner.ErrCode(err) == codes.NotFound }
 
@@ -89,6 +110,17 @@ func (s *Spanner) Get(id object.ID) ([]byte, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 	row, err := s.c.Single().ReadRow(ctx, "Objects", spanner.Key{id[:keyIDLen]}, []string{"Data"})
+	if notFound(err) && s.bucket != nil {
+		b, err := s.bucket.ReadAll(ctx, blobKey(id))
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return nil, object.ErrNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		s.hot.Put(id, b)
+		return b, nil
+	}
 	if notFound(err) {
 		return nil, object.ErrNotFound
 	}
@@ -117,6 +149,13 @@ func (s *Spanner) Has(id object.ID) (bool, error) {
 func (s *Spanner) Put(id object.ID, stored []byte) error {
 	ctx, cancel := s.ctx()
 	defer cancel()
+	if s.bucket != nil && isBlob(stored) {
+		err := s.bucket.WriteAll(ctx, blobKey(id), stored, nil)
+		if err == nil {
+			s.hot.Put(id, stored)
+		}
+		return err
+	}
 	_, err := s.c.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("Objects", []string{"Id", "Data"}, []any{id[:keyIDLen], stored})})
 	if err == nil {
 		s.hot.Put(id, stored)
@@ -402,6 +441,12 @@ func (s *Spanner) Stats() map[string]any {
 }
 
 func (s *Spanner) Flush() error { return nil }
-func (s *Spanner) Close() error { s.c.Close(); return nil }
+func (s *Spanner) Close() error {
+	s.c.Close()
+	if s.bucket != nil {
+		return s.bucket.Close()
+	}
+	return nil
+}
 
 var _ Backend = (*Spanner)(nil)

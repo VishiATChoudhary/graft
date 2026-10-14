@@ -154,10 +154,12 @@ gft import --store $NODES --git ~/src/myrepo
 ```
 
 On Google Cloud, point API servers at Spanner instead, the backend Scion
-uses (`--spanner-init` creates the tables once):
+uses, with file contents in cloud storage (`--blobs`: `gs://`, `s3://` or
+`file://`; `--spanner-init` creates the tables once):
 
 ```sh
-gft serve --spanner projects/P/instances/I/databases/graft --spanner-init --listen :7500
+gft serve --spanner projects/P/instances/I/databases/graft --blobs gs://my-bucket \
+    --spanner-init --listen :7500
 ```
 
 Each shard can be a replica set: list replicas with `|`. Data is written to

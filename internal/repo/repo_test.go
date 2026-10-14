@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,8 +31,16 @@ func newBackend(t *testing.T) store.Backend {
 	if n, _ := strconv.Atoi(os.Getenv("GRAFT_TEST_SHARDS")); n > 0 {
 		return newFleet(t, n)
 	}
-	if os.Getenv("GRAFT_TEST_SPANNER") != "" {
-		s, closeFn, err := store.OpenFakeSpanner()
+	if mode := os.Getenv("GRAFT_TEST_SPANNER"); mode != "" {
+		blobs := ""
+		if mode == "blobs" { // file contents in a bucket, as with cloud storage
+			dir := filepath.ToSlash(t.TempDir())
+			if !strings.HasPrefix(dir, "/") {
+				dir = "/" + dir // file:///C:/...
+			}
+			blobs = "file://" + dir
+		}
+		s, closeFn, err := store.OpenFakeSpanner(blobs)
 		if err != nil {
 			t.Fatal(err)
 		}

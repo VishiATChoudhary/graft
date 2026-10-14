@@ -245,8 +245,10 @@ renames are followed. Server-side merges use diff3.
 ## Where graft differs from the post
 
 * **Storage backend.** `gft serve --spanner projects/P/instances/I/databases/D`
-  runs stateless API servers directly on Cloud Spanner, as Scion does:
-  objects and derived data are rows, ref CAS is a single conditional
+  runs stateless API servers directly on Cloud Spanner, as Scion does,
+  with file contents in cloud storage when `--blobs` names a bucket
+  (`gs://`, `s3://`, `file://`): trees, changesets and derived data are
+  rows, ref CAS is a single conditional
   statement, log sequences are assigned in read-write transactions, and
   Spanner provides replication, failover and scaling. CI runs the full
   repository suite against it (in-memory `spannertest`); it has not been run

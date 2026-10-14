@@ -31,6 +31,7 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	tier := fs.String("tier", "server", "server | cache | daemon | store")
 	spannerDB := fs.String("spanner", "", "server: Cloud Spanner database projects/P/instances/I/databases/D (stateless API server)")
+	blobsURL := fs.String("blobs", "", "server with --spanner: bucket for file contents (gs://bucket, s3://bucket, file:///dir)")
 	spannerInit := fs.Bool("spanner-init", false, "server: create graft's tables in the --spanner database first")
 	peers := fs.String("peers", "", "server: every API server's URL, comma-separated, for ref affinity of lands (optional)")
 	self := fs.Int("self", 0, "server: this server's index in --peers")
@@ -65,7 +66,7 @@ func cmdServe(args []string) error {
 					return err
 				}
 			}
-			sp, err := store.OpenSpanner(ctx, *spannerDB, mustSize(*mem))
+			sp, err := store.OpenSpanner(ctx, *spannerDB, mustSize(*mem), *blobsURL)
 			if err != nil {
 				return err
 			}

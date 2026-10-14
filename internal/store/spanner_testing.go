@@ -15,7 +15,7 @@ var fakeSpannerN atomic.Int64
 
 // OpenFakeSpanner starts an in-memory Spanner (cloud.google.com/go/spanner/spannertest)
 // with graft's schema and returns a backend on it, for tests.
-func OpenFakeSpanner() (*Spanner, func(), error) {
+func OpenFakeSpanner(blobs string) (*Spanner, func(), error) {
 	srv, err := spannertest.NewServer("localhost:0")
 	if err != nil {
 		return nil, nil, err
@@ -31,7 +31,7 @@ func OpenFakeSpanner() (*Spanner, func(), error) {
 	}
 	os.Setenv("SPANNER_EMULATOR_HOST", srv.Addr)
 	db := fmt.Sprintf("projects/p/instances/i/databases/d%d", fakeSpannerN.Add(1))
-	s, err := OpenSpanner(context.Background(), db, 64<<20)
+	s, err := OpenSpanner(context.Background(), db, 64<<20, blobs)
 	if err != nil {
 		srv.Close()
 		return nil, nil, err
