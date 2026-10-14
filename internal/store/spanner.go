@@ -156,7 +156,9 @@ func derivedCacheKey(kind string, id object.ID) object.ID {
 	return versionKeyBytes([]byte(kind), id[:])
 }
 
-func versionKeyBytes(a, b []byte) object.ID { return object.Hash(object.KindBlob, append(append([]byte{}, a...), b...)) }
+func versionKeyBytes(a, b []byte) object.ID {
+	return object.Hash(object.KindBlob, append(append([]byte{}, a...), b...))
+}
 
 func (s *Spanner) GetDerived(kind string, id object.ID) ([]byte, error) {
 	ck := derivedCacheKey(kind, id)
@@ -403,4 +405,3 @@ func (s *Spanner) Flush() error { return nil }
 func (s *Spanner) Close() error { s.c.Close(); return nil }
 
 var _ Backend = (*Spanner)(nil)
-
