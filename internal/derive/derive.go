@@ -110,6 +110,12 @@ func (e *Engine) Derive(t *Type, id object.ID) ([]byte, error) {
 	return e.derive(t, id)
 }
 
+// Cached returns t at id if it is in memory, without any store lookup.
+func (e *Engine) Cached(t *Type, id object.ID) ([]byte, bool) {
+	v, err := t.mem.Get(id)
+	return v, err == nil
+}
+
 // Recompute derives t at id again even if a value is cached, rewriting
 // it (values are deterministic). Used to regenerate lost side records.
 func (e *Engine) Recompute(t *Type, id object.ID) ([]byte, error) { return e.derive(t, id) }

@@ -1063,6 +1063,11 @@ func cmdLoadgen(args []string) error {
 	ref := fs.String("ref", "main", "ref to land on")
 	parse(fs, args)
 	urls := strings.Split(*servers, ",")
+	c0, _ := apiClient(urls[len(urls)-1])
+	before, err := c0.Resolve(bg(), *ref)
+	if err != nil {
+		return err
+	}
 	var wg sync.WaitGroup
 	errs := make(chan error, *agents)
 	start := time.Now()
@@ -1088,7 +1093,22 @@ func cmdLoadgen(args []string) error {
 		return err
 	}
 	n := *agents * *per
-	fmt.Printf("%d lands in %s: %.1f lands/s\n", n, wall.Round(time.Millisecond), float64(n)/wall.Seconds())
+	// Verify: history grew by exactly one changeset per land, linearly,
+	// and every agent's files are present (read through another server).
+	after, err := c0.Resolve(bg(), *ref)
+	if err != nil {
+		return err
+	}
+	if after.Depth != before.Depth+uint64(n) {
+		return fmt.Errorf("verify: history depth %d, want %d", after.Depth, before.Depth+uint64(n))
+	}
+	for a := 0; a < *agents; a++ {
+		ents, err := c0.Ls(bg(), after.ID.String(), fmt.Sprintf("agents/%d", a))
+		if err != nil || len(ents) != *per {
+			return fmt.Errorf("verify: agent %d has %d files (%v), want %d", a, len(ents), err, *per)
+		}
+	}
+	fmt.Printf("%d lands in %s: %.1f lands/s (verified)\n", n, wall.Round(time.Millisecond), float64(n)/wall.Seconds())
 	return nil
 }
 

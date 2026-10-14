@@ -441,7 +441,11 @@ func (s *Server) write(r *http.Request) (any, error) {
 		}
 		cs.Changes = append(cs.Changes, object.Change{Path: f.Path, Mode: mode, Blob: id})
 	}
-	id, err := s.Repo.Create(cs)
+	create := s.Repo.Create
+	if req.Land != "" {
+		create = s.Repo.CreateForLand
+	}
+	id, err := create(cs)
 	if err != nil {
 		return nil, err
 	}

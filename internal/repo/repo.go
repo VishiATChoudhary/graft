@@ -83,6 +83,19 @@ func (r *Repo) LogSize() uint64 {
 // derived data. Cost scales with the size of the change, not the repo.
 // It takes no global lock: concurrent creations proceed in parallel.
 func (r *Repo) Create(cs *object.Changeset) (object.ID, error) {
+	return r.create(cs, true)
+}
+
+// CreateForLand is Create for a changeset that is about to be landed (and
+// so usually rebased right away): it is stored and logged, but its derived
+// data is left to be computed on demand, typically by the server running
+// the land, which has the newest history in cache. Derived data is always
+// derivable, so nothing is lost; only work that would be wasted is.
+func (r *Repo) CreateForLand(cs *object.Changeset) (object.ID, error) {
+	return r.create(cs, r.OnCreate != nil)
+}
+
+func (r *Repo) create(cs *object.Changeset, eager bool) (object.ID, error) {
 	if err := cs.Normalize(); err != nil {
 		return object.Zero, fmt.Errorf("%w: %v", ErrBadChange, err)
 	}
@@ -104,6 +117,14 @@ func (r *Repo) Create(cs *object.Changeset) (object.ID, error) {
 		if !ok {
 			return object.Zero, fmt.Errorf("%w: blob %s for %s", ErrMissing, ch.Blob.Short(), ch.Path)
 		}
+	}
+	if !eager {
+		id, stored := object.Encode(object.KindChangeset, cs.Encode())
+		if err := r.DB.Put(id, stored); err != nil {
+			return object.Zero, err
+		}
+		_, err := r.DB.AppendLog(id)
+		return id, err
 	}
 	return r.append(cs)
 }
@@ -219,18 +240,19 @@ func (r *Repo) Resolve(rev string) (object.ID, error) {
 }
 
 func (r *Repo) resolveBase(rev string) (object.ID, error) {
-	if id, err := r.DB.GetRef(rev); err == nil {
-		return id, nil
-	} else if !errors.Is(err, object.ErrNotFound) {
-		return object.Zero, err
-	}
+	// A full ID of a logged changeset needs no ref lookup (and ref names
+	// that are 64 hex digits would be indistinguishable from IDs anyway).
 	if len(rev) == 64 {
-		id, err := object.ParseID(rev)
-		if err == nil {
+		if id, err := object.ParseID(rev); err == nil {
 			if _, err := r.DB.LogSeq(id); err == nil {
 				return id, nil
 			}
 		}
+	}
+	if id, err := r.DB.GetRef(rev); err == nil {
+		return id, nil
+	} else if !errors.Is(err, object.ErrNotFound) {
+		return object.Zero, err
 	}
 	if len(rev) >= 8 && len(rev) < 64 {
 		if id, err := r.resolvePrefix(rev); err == nil {

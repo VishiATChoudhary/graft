@@ -255,7 +255,7 @@ func (r *Repo) stackOnto(head, trunk object.ID) ([]object.ID, bool, error) {
 	var stack []object.ID
 	const maxStack = 10000
 	for x := head; len(stack) < maxStack; {
-		g, err := r.Graph(x)
+		g, err := r.stackGraph(x, 64)
 		if err != nil {
 			return nil, false, err
 		}
@@ -454,6 +454,29 @@ func (r *Repo) landBatch(ref string, l *lander, batch []*landReq) {
 	}
 }
 
+// stackGraph returns x's depth and parents for stack walks. A changeset
+// just created for landing has no derived record yet, and computing one
+// (root tree, history) would be wasted on a changeset about to be rebased;
+// its depth is its parent's plus one. Falls back to the full record when x
+// is not a simple child or the walk gets long.
+func (r *Repo) stackGraph(x object.ID, budget int) (*GraphNode, error) {
+	if g := r.nodes.get(x); g != nil {
+		return g, nil
+	}
+	if budget > 0 {
+		if _, ok := r.eng.Cached(r.cs, x); !ok {
+			if cs, err := r.Changeset(x); err == nil && len(cs.Parents) == 1 {
+				pg, err := r.stackGraph(cs.Parents[0], budget-1)
+				if err != nil {
+					return nil, err
+				}
+				return &GraphNode{Gen: pg.Gen + 1, Depth: pg.Depth + 1, Parents: cs.Parents}, nil
+			}
+		}
+	}
+	return r.Graph(x)
+}
+
 // prefetchLands reads, in parallel, what rebasing each request onto tip
 // will need (graph records, the stacked changesets, their base trees), so
 // the serial rebase chain inside a batch runs from cache. On a sharded
@@ -501,15 +524,19 @@ func (r *Repo) landOnto(logged, cur, head object.ID, author string, when int64, 
 	if cur.IsZero() {
 		return head, 0, false, nil, nil
 	}
-	if !pending {
-		ff, err := r.IsAncestor(cur, head)
-		if err != nil || ff {
-			return head, 0, false, nil, err
-		}
-	}
 	stack, ok, err := r.stackOnto(head, logged)
 	if err != nil {
 		return object.Zero, 0, false, nil, err
+	}
+	if ok && len(stack) > 0 && !pending {
+		// Fast-forward: head's own changesets already sit on cur.
+		first, err := r.Changeset(stack[0])
+		if err != nil {
+			return object.Zero, 0, false, nil, err
+		}
+		if len(first.Parents) == 1 && first.Parents[0] == cur {
+			return head, 0, false, nil, nil
+		}
 	}
 	if !ok {
 		if pending {

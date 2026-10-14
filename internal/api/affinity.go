@@ -53,9 +53,11 @@ func (s *Server) landRouted(r *http.Request, ref string, id object.ID, author st
 			// Owner unreachable: land here; the CAS keeps it correct.
 		}
 	}
-	tip, _ := s.Repo.Ref(ref)
-	if err := s.requireReviews(id, tip); err != nil {
-		return nil, err
+	if s.ACL != nil && len(s.ACL.Reviews) > 0 {
+		tip, _ := s.Repo.Ref(ref)
+		if err := s.requireReviews(id, tip); err != nil {
+			return nil, err
+		}
 	}
 	return s.Repo.Land(ref, id, author, when, 0, s.checkRefMove(r.Context()))
 }

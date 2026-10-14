@@ -55,6 +55,7 @@ type Sharded struct {
 	// barrier() waits for every queued write before anything that can
 	// reference those objects is published (log, derived data, refs).
 	queued        sync.Map // ID -> stored bytes, until written
+	putQs         []*putQueue
 	byID          sync.Map // ID -> *pendingWrite
 	dmuQ          sync.Mutex
 	dq            []derivedItem
@@ -107,6 +108,9 @@ func NewSharded(nodes []string, cacheBytes int64) *Sharded {
 	s := &Sharded{shards: ParseFleet(nodes), client: &http.Client{Transport: tr, Timeout: 5 * time.Minute},
 		hot: NewMemLRU(cacheBytes / 2), payloads: NewMemLRU(cacheBytes / 2), inflight: make(chan struct{}, 64), waiting: map[uint64]chan struct{}{}}
 	s.leader.Store("")
+	for range s.shards {
+		s.putQs = append(s.putQs, &putQueue{})
+	}
 	return s
 }
 
@@ -380,24 +384,82 @@ func (s *Sharded) PutBase(id object.ID, stored []byte, base object.ID) error {
 	t := s.ticket
 	s.waiting[t] = done
 	s.pendMu.Unlock()
-	s.inflight <- struct{}{}
-	go func() {
-		err := s.writeAll(s.replicas(id), "/kv/put", putFrame(id, base, stored))
-		pw.err = err
-		if err == nil { // failures stay visible to waitFor until rewritten
-			s.byID.CompareAndDelete(id, pw)
+	s.enqueuePut(ShardOf(id, len(s.shards)), queuedPut{id, base, stored, pw, t})
+	return nil
+}
+
+type queuedPut struct {
+	id, base object.ID
+	stored   []byte
+	pw       *pendingWrite
+	ticket   uint64
+}
+
+// putQueue group-commits object writes to one shard: whatever queued up
+// while a request was in flight goes out together in the next one, so a
+// busy server sends a few large requests instead of one per object.
+type putQueue struct {
+	mu      sync.Mutex
+	items   []queuedPut
+	writers int
+}
+
+// putWriters is how many requests per shard may be in flight at once.
+const putWriters = 2
+
+func (s *Sharded) enqueuePut(shard int, q queuedPut) {
+	pq := s.putQs[shard]
+	pq.mu.Lock()
+	pq.items = append(pq.items, q)
+	start := pq.writers < putWriters
+	if start {
+		pq.writers++
+	}
+	pq.mu.Unlock()
+	if start {
+		go s.putWriter(shard, pq)
+	}
+}
+
+func (s *Sharded) putWriter(shard int, pq *putQueue) {
+	for {
+		pq.mu.Lock()
+		// Take up to about 4 MB.
+		n, size := 0, 0
+		for n < len(pq.items) && (n == 0 || size+len(pq.items[n].stored) < 4<<20) {
+			size += len(pq.items[n].stored) + 68
+			n++
 		}
-		s.queued.Delete(id)
-		<-s.inflight
+		if n == 0 {
+			pq.writers--
+			pq.mu.Unlock()
+			return
+		}
+		batch := append([]queuedPut(nil), pq.items[:n]...)
+		pq.items = pq.items[n:]
+		pq.mu.Unlock()
+		body := make([]byte, 0, size)
+		for _, q := range batch {
+			body = append(body, putFrame(q.id, q.base, q.stored)...)
+		}
+		err := s.writeAll(s.shards[shard], "/kv/put", body)
 		s.pendMu.Lock()
 		if err != nil && s.pendErr == nil {
 			s.pendErr = err
 		}
-		delete(s.waiting, t)
+		for _, q := range batch {
+			delete(s.waiting, q.ticket)
+		}
 		s.pendMu.Unlock()
-		close(done)
-	}()
-	return nil
+		for _, q := range batch {
+			q.pw.err = err
+			if err == nil { // failures stay visible to waitFor until rewritten
+				s.byID.CompareAndDelete(q.id, q.pw)
+			}
+			s.queued.Delete(q.id)
+			close(q.pw.done)
+		}
+	}
 }
 
 type pendingWrite struct {
@@ -439,19 +501,38 @@ func (s *Sharded) barrier() error {
 }
 
 // Deltify is a storage hint: it is queued and sent to every replica in the
-// background (dropped if the queue is full), keeping it off the write path.
+// background, batched per shard (dropped if the queue is full), keeping it
+// off the write path.
 func (s *Sharded) Deltify(id, base object.ID) error {
 	s.hintsOnce.Do(func() {
-		s.hints = make(chan [2]object.ID, 4096)
-		for i := 0; i < 4; i++ {
-			go func() {
-				for h := range s.hints {
-					for _, u := range s.replicas(h[0]) {
-						s.call("POST", u+"/kv/deltify", append(h[0][:len(h[0]):len(h[0])], h[1][:]...))
+		s.hints = make(chan [2]object.ID, 8192)
+		go func() {
+			for h := range s.hints {
+				batch := [][2]object.ID{h}
+			drain:
+				for len(batch) < 4096 {
+					select {
+					case h := <-s.hints:
+						batch = append(batch, h)
+					default:
+						break drain
 					}
 				}
-			}()
-		}
+				bodies := map[int][]byte{}
+				for _, h := range batch {
+					if s.waitFor(h[0], h[1]) != nil { // both must be stored first
+						continue
+					}
+					sh := ShardOf(h[0], len(s.shards))
+					bodies[sh] = append(append(bodies[sh], h[0][:]...), h[1][:]...)
+				}
+				for sh, body := range bodies {
+					for _, u := range s.shards[sh] {
+						s.call("POST", u+"/kv/deltify", body)
+					}
+				}
+			}
+		}()
 	})
 	select {
 	case s.hints <- [2]object.ID{id, base}:
