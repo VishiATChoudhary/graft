@@ -1,14 +1,16 @@
-First release of graft, an open-source implementation of the source control
-design in Anthropic's "Redesigning source control" post.
+graft, an open-source implementation of the source control design in
+Anthropic's "Redesigning source control" post.
 
-Each archive holds two binaries:
+Since v0.1.0:
 
-* `gft`: client, server, cache, daemon and storage tiers, mount, watch.
-* `gft-cloud`: the same plus the Cloud Spanner and cloud-storage backends
-  (`gft serve --spanner ... --blobs gs://...`).
+* Change requests, a merge queue that lands approved requests, and a review
+  web UI at `<server>/review` (`gft cr`).
+* Indexed code search (per-directory trigram filters) and path search.
+* Cloud Spanner backend tested against a real instance; concurrent log
+  appends are group-committed. File contents can live in a bucket
+  (`--blobs gs://...`).
+* Faster cold blame; the everyday `gft` binary leaves the cloud SDKs out
+  (26 MB, about 5 ms to start).
 
-Install from source instead with `go install github.com/VishiATChoudhary/graft/cmd/gft@latest`.
-
-See the README for benchmarks against git and docs/DESIGN.md for how it
-works and where it differs from the post. Verify downloads with
-`checksums.txt`.
+Each archive holds `gft` and `gft-cloud` (adds the Cloud Spanner and
+cloud-storage backends). Verify downloads with `checksums.txt`.
