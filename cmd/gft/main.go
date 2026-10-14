@@ -67,6 +67,7 @@ Infrastructure:
   gft serve --tier daemon --upstream <cache> [--listen unix:///run/gft.sock] [--disk 20G] [--seed file]
   gft snapshot --server <url> --rev main --out <file>
   gft import --data <dir> --git <repo> [--ref refs/heads/main]...
+  gft cr create|list|show|revise|comment|queue|close   change requests and the merge queue (web UI: <server>/review)
   gft compact --data <dir> [--window 50]   optional: re-delta whole blobs against similar ones (never required)
   gft info [--server url]
 
@@ -138,6 +139,8 @@ func main() {
 		err = cmdGrep(args)
 	case "approve":
 		err = cmdApprove(args)
+	case "cr":
+		err = cmdCR(args)
 	case "review":
 		err = cmdReview(args)
 	case "refs":
@@ -1002,6 +1005,85 @@ func printReview(st *api.ReviewStatus) {
 			fmt.Printf("      exempt:       %s\n", f)
 		}
 	}
+}
+
+// cmdCR manages change requests (the web UI is at <server>/review).
+func cmdCR(args []string) error {
+	usage := errors.New(`usage: gft cr create [--title T] [--target REF] [-m DESCRIPTION] [rev]
+       gft cr list [--state open|queued|landed|closed]
+       gft cr show <id>
+       gft cr revise <id> [rev]
+       gft cr comment <id> [--path P --line N] <text>
+       gft cr queue <id>      land as soon as review rules are satisfied
+       gft cr close <id>`)
+	if len(args) == 0 {
+		return usage
+	}
+	sub, args := args[0], args[1:]
+	fs := flag.NewFlagSet("cr "+sub, flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	title := fs.String("title", "", "title (default: first line of the message)")
+	target := fs.String("target", "main", "ref to land on")
+	desc := fs.String("m", "", "description")
+	state := fs.String("state", "open", "filter by state (empty for all)")
+	path := fs.String("path", "", "file the comment is about")
+	line := fs.Int("line", 0, "line of --path the comment is about")
+	pos := parse(fs, args)
+	c, wt := apiClient(*server)
+	arg := func(i int, def string) string {
+		if i < len(pos) {
+			return pos[i]
+		}
+		return def
+	}
+	var cr *api.ChangeRequest
+	var err error
+	switch sub {
+	case "create":
+		cr, err = c.CreateCR(bg(), revOr(arg(0, ""), wt), *target, *title, *desc)
+	case "list":
+		list, err := c.ListCRs(bg(), *state)
+		if err != nil {
+			return err
+		}
+		for _, cr := range list {
+			fmt.Printf("%s  %-7s %-40s %s -> %s\n", cr.ID, cr.State, cr.Title, cr.Author, cr.Target)
+		}
+		return nil
+	case "show":
+		cr, err = c.GetCR(bg(), arg(0, ""))
+	case "revise":
+		cr, err = c.ReviseCR(bg(), arg(0, ""), revOr(arg(1, ""), wt))
+	case "comment":
+		cr, err = c.CommentCR(bg(), arg(0, ""), *path, *line, strings.Join(pos[min(1, len(pos)):], " "))
+	case "queue":
+		cr, err = c.QueueCR(bg(), arg(0, ""))
+	case "close":
+		cr, err = c.CloseCR(bg(), arg(0, ""))
+	default:
+		return usage
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s %s: %s\n  %s -> %s, head %s, %d revision(s), %d comment(s)\n", cr.ID, cr.State, cr.Title, cr.Author, cr.Target,
+		cr.Head.Short(), len(cr.Revisions), len(cr.Comments))
+	if cr.Waiting != "" {
+		fmt.Printf("  merge queue: %s\n", cr.Waiting)
+	}
+	if !cr.Landed.IsZero() {
+		fmt.Printf("  landed as %s\n", cr.Landed.Short())
+	}
+	if sub == "show" {
+		for _, cm := range cr.Comments {
+			where := ""
+			if cm.Path != "" {
+				where = fmt.Sprintf(" %s:%d", cm.Path, cm.Line)
+			}
+			fmt.Printf("  #%d %s%s: %s\n", cm.N, cm.Author, where, cm.Text)
+		}
+	}
+	return nil
 }
 
 func cmdApprove(args []string) error {

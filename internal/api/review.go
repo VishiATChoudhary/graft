@@ -185,6 +185,7 @@ func (s *Server) approve(ctx context.Context, rev string) (*ReviewStatus, error)
 	if err := s.Repo.UpdateRef(approvalRef(id, who), object.Zero, id); err != nil && !errors.Is(err, repo.ErrStaleRef) {
 		return nil, err
 	}
+	go s.processQueue() // a queued change request may now be landable
 	tip, _ := s.Repo.Ref("main")
 	return s.reviewStatus(id, tip)
 }

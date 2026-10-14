@@ -345,3 +345,44 @@ func IsConflict(err error) ([]string, bool) {
 	}
 	return nil, false
 }
+
+// Change requests.
+
+func (c *Client) CreateCR(ctx context.Context, head, target, title, description string) (*ChangeRequest, error) {
+	var out ChangeRequest
+	return &out, c.do(ctx, "POST", "/v1/cr/create", nil, map[string]string{"Head": head, "Target": target, "Title": title, "Description": description}, &out)
+}
+
+func (c *Client) GetCR(ctx context.Context, id string) (*ChangeRequest, error) {
+	var out ChangeRequest
+	return &out, c.do(ctx, "GET", "/v1/cr", url.Values{"id": {id}}, nil, &out)
+}
+
+func (c *Client) ListCRs(ctx context.Context, state string) ([]*ChangeRequest, error) {
+	var out []*ChangeRequest
+	q := url.Values{}
+	if state != "" {
+		q.Set("state", state)
+	}
+	return out, c.do(ctx, "GET", "/v1/crs", q, nil, &out)
+}
+
+func (c *Client) ReviseCR(ctx context.Context, id, head string) (*ChangeRequest, error) {
+	var out ChangeRequest
+	return &out, c.do(ctx, "POST", "/v1/cr/revise", nil, map[string]string{"ID": id, "Head": head}, &out)
+}
+
+func (c *Client) CommentCR(ctx context.Context, id, path string, line int, text string) (*ChangeRequest, error) {
+	var out ChangeRequest
+	return &out, c.do(ctx, "POST", "/v1/cr/comment", nil, map[string]any{"ID": id, "Path": path, "Line": line, "Text": text}, &out)
+}
+
+func (c *Client) QueueCR(ctx context.Context, id string) (*ChangeRequest, error) {
+	var out ChangeRequest
+	return &out, c.do(ctx, "POST", "/v1/cr/queue", nil, map[string]string{"ID": id}, &out)
+}
+
+func (c *Client) CloseCR(ctx context.Context, id string) (*ChangeRequest, error) {
+	var out ChangeRequest
+	return &out, c.do(ctx, "POST", "/v1/cr/close", nil, map[string]string{"ID": id}, &out)
+}

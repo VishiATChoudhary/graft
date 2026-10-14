@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>graft review</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 0; color: #1f2328; background: #f6f8fa; }
+  header { background: #24292f; color: #fff; padding: 10px 20px; display: flex; gap: 16px; align-items: center; }
+  header a { color: #fff; text-decoration: none; font-weight: 600; }
+  header input { margin-left: auto; padding: 4px 8px; border-radius: 4px; border: 0; width: 220px; }
+  main { max-width: 1100px; margin: 20px auto; padding: 0 20px; }
+  .card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; margin-bottom: 16px; }
+  .card h2, .card h3 { margin: 0; padding: 10px 14px; border-bottom: 1px solid #d0d7de; font-size: 15px; }
+  table.list { width: 100%; border-collapse: collapse; }
+  table.list td { padding: 8px 14px; border-top: 1px solid #eaeef2; }
+  .state { border-radius: 10px; padding: 1px 8px; font-size: 12px; color: #fff; }
+  .open { background: #1f883d; } .queued { background: #9a6700; } .landed { background: #8250df; } .closed { background: #6e7781; }
+  .meta { color: #656d76; font-size: 12px; }
+  button { padding: 5px 12px; border-radius: 6px; border: 1px solid #d0d7de; background: #f6f8fa; cursor: pointer; }
+  button.primary { background: #1f883d; color: #fff; border-color: #1f883d; }
+  .actions { padding: 10px 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .rules div { padding: 4px 14px; }
+  .ok { color: #1a7f37; } .bad { color: #cf222e; }
+  table.diff { width: 100%; border-collapse: collapse; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  table.diff td { padding: 0 8px; white-space: pre-wrap; word-break: break-all; vertical-align: top; }
+  table.diff td.n { color: #8c959f; text-align: right; width: 1%; user-select: none; cursor: pointer; }
+  tr.add td.c { background: #e6ffec; } tr.del td.c { background: #ffebe9; } tr.hunk td { background: #ddf4ff; color: #57606a; }
+  tr.cm td { background: #fff8c5; font-family: -apple-system, system-ui, sans-serif; padding: 6px 10px; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 60px; font: inherit; }
+  .comment { padding: 8px 14px; border-top: 1px solid #eaeef2; }
+  .err { color: #cf222e; padding: 8px 14px; }
+</style>
+</head>
+<body>
+<header>
+  <a href="#">graft review</a>
+  <a href="#" onclick="filter='open';route();return false">open</a>
+  <a href="#" onclick="filter='queued';route();return false">queued</a>
+  <a href="#" onclick="filter='';route();return false">all</a>
+  <input id="token" placeholder="access token (optional)">
+</header>
+<main id="main"></main>
+<script>
+"use strict";
+let filter = "open";
+const $ = (t, attrs = {}, ...kids) => {
+  const e = document.createElement(t);
+  for (const [k, v] of Object.entries(attrs)) k.startsWith("on") ? e[k] = v : e.setAttribute(k, v);
+  for (const k of kids) e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return e;
+};
+const tokenInput = document.getElementById("token");
+tokenInput.value = localStorage.getItem("graftToken") || "";
+tokenInput.onchange = () => localStorage.setItem("graftToken", tokenInput.value);
+async function api(path, body) {
+  const headers = {};
+  if (tokenInput.value) headers.Authorization = "Bearer " + tokenInput.value;
+  const opts = body === undefined ? { headers } : { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  const text = await r.text();
+  if (!r.ok) { let m = text; try { m = JSON.parse(text).error } catch (_) {} throw new Error(m); }
+  return r.headers.get("Content-Type")?.includes("json") ? JSON.parse(text) : text;
+}
+const ago = t => { const s = Date.now() / 1000 - t; return s < 90 ? "just now" : s < 5400 ? Math.round(s / 60) + " min ago" : s < 129600 ? Math.round(s / 3600) + " h ago" : Math.round(s / 86400) + " d ago"; };
+const main = document.getElementById("main");
+
+async function route() {
+  const id = location.hash.slice(1);
+  main.replaceChildren();
+  try { id ? await showCR(id) : await showList(); }
+  catch (e) { main.append($("div", { class: "card err" }, e.message)); }
+}
+window.onhashchange = route;
+
+async function showList() {
+  const crs = await api("/v1/crs" + (filter ? "?state=" + filter : ""));
+  const t = $("table", { class: "list" });
+  for (const cr of crs) {
+    t.append($("tr", {},
+      $("td", {}, $("span", { class: "state " + cr.state }, cr.state)),
+      $("td", {}, $("a", { href: "#" + cr.id }, cr.title), $("div", { class: "meta" }, `${cr.id} by ${cr.author} into ${cr.target}, ${cr.revisions.length} revision(s), updated ${ago(cr.updated)}`))));
+  }
+  if (!crs.length) t.append($("tr", {}, $("td", {}, "No change requests.")));
+  main.append($("div", { class: "card" }, $("h2", {}, (filter || "all") + " change requests"), t));
+}
+
+async function showCR(id) {
+  const cr = await api("/v1/cr?id=" + encodeURIComponent(id));
+  const head = cr.head;
+  const [status, patch] = await Promise.all([
+    api(`/v1/reviews/status?id=${head}&ref=${encodeURIComponent(cr.target)}`).catch(e => ({ error: e.message })),
+    cr.state === "landed" ? api(`/v1/diff?to=${head}&patch=1`) : api(`/v1/diff?to=${head}&mergebase=${encodeURIComponent(cr.target)}&patch=1`),
+  ]);
+  const act = (label, fn, cls = "") => $("button", { class: cls, onclick: async () => { try { await fn(); route(); } catch (e) { alert(e.message); } } }, label);
+  const actions = $("div", { class: "actions" });
+  if (cr.state === "open" || cr.state === "queued") {
+    actions.append(act("Approve revision", () => api("/v1/reviews/approve", { ID: head })));
+    if (cr.state === "open") actions.append(act("Add to merge queue", () => api("/v1/cr/queue", { ID: cr.id }), "primary"));
+    actions.append(act("Close", () => api("/v1/cr/close", { ID: cr.id })));
+  }
+  const top = $("div", { class: "card" },
+    $("h2", {}, $("span", { class: "state " + cr.state }, cr.state), " ", cr.title),
+    $("div", { class: "actions meta" }, `${cr.id} by ${cr.author} into ${cr.target}; head ${head.slice(0, 12)}` + (cr.landed ? `; landed as ${cr.landed.slice(0, 12)}` : "")),
+    cr.description ? $("div", { class: "comment" }, cr.description) : "",
+    cr.waiting ? $("div", { class: "err" }, "Merge queue: " + cr.waiting) : "",
+    actions);
+  main.append(top);
+
+  const rules = $("div", { class: "card rules" }, $("h3", {}, "Review rules"));
+  if (status.error) rules.append($("div", { class: "err" }, status.error));
+  else if (!status.rules || !status.rules.length) rules.append($("div", { class: "ok" }, "No review rules apply."));
+  else for (const r of status.rules) rules.append($("div", { class: r.satisfied ? "ok" : "bad" },
+    `${r.satisfied ? "✓" : "✗"} ${r.path || "/"}: ${r.approvals.length}/${r.required} approval(s)` + (r.approvals.length ? " (" + r.approvals.join(", ") + ")" : "") +
+    (r.exempted && r.exempted.length ? `; exempt: ${r.exempted.join(", ")}` : "")));
+  main.append(rules);
+
+  const revs = $("div", { class: "card" }, $("h3", {}, "Revisions"));
+  cr.revisions.forEach((r, i) => revs.append($("div", { class: "comment meta" }, `#${i + 1} ${r.head.slice(0, 12)} by ${r.author}, ${ago(r.time)}`)));
+  main.append(revs);
+
+  main.append(renderDiff(patch, cr));
+
+  const general = $("div", { class: "card" }, $("h3", {}, "Discussion"));
+  for (const c of (cr.comments || []).filter(c => !c.path)) general.append(commentEl(c));
+  const ta = $("textarea", { placeholder: "Leave a comment" });
+  general.append($("div", { class: "actions" }, ta, act("Comment", () => api("/v1/cr/comment", { ID: cr.id, Text: ta.value }), "primary")));
+  main.append(general);
+}
+
+const commentEl = c => $("div", { class: "comment" }, $("div", { class: "meta" }, `${c.author}, ${ago(c.time)}` + (c.revision ? ` on ${c.revision.slice(0, 12)}` : "")), c.text);
+
+function renderDiff(patch, cr) {
+  const card = $("div", { class: "card" }, $("h3", {}, "Changes"));
+  const t = $("table", { class: "diff" });
+  const byLine = {};
+  for (const c of cr.comments || []) if (c.path) (byLine[c.path + ":" + c.line] ||= []).push(c);
+  let path = "", oldN = 0, newN = 0;
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("diff ")) { t.append($("tr", { class: "hunk" }, $("td", { colspan: 3 }, line))); continue; }
+    if (line.startsWith("+++ ")) { path = line.slice(4).replace(/^b\//, ""); continue; }
+    if (line.startsWith("--- ") || line.startsWith("index ") || line.startsWith("new file") || line.startsWith("deleted file")) continue;
+    const m = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)/);
+    if (m) { oldN = +m[1]; newN = +m[2]; t.append($("tr", { class: "hunk" }, $("td", { colspan: 3 }, line))); continue; }
+    if (line === "") continue;
+    const kind = line[0] === "+" ? "add" : line[0] === "-" ? "del" : "";
+    const o = kind === "add" ? "" : oldN++, n = kind === "del" ? "" : newN++;
+    const p = path, ln = n;
+    const numCell = $("td", { class: "n", title: "comment on this line" }, n);
+    const row = $("tr", { class: kind }, $("td", { class: "n" }, o), numCell, $("td", { class: "c" }, line));
+    t.append(row);
+    if (n !== "") {
+      numCell.onclick = () => {
+        const ta = $("textarea", { placeholder: `Comment on ${p}:${ln}` });
+        const form = $("tr", { class: "cm" }, $("td", { colspan: 3 }, ta, $("button", { class: "primary", onclick: async () => {
+          try { await api("/v1/cr/comment", { ID: cr.id, Path: p, Line: ln, Text: ta.value }); route(); } catch (e) { alert(e.message); } } }, "Comment")));
+        row.after(form); ta.focus();
+      };
+      for (const c of byLine[p + ":" + n] || []) t.append($("tr", { class: "cm" }, $("td", { colspan: 3 }, commentEl(c))));
+    }
+  }
+  card.append(t);
+  return card;
+}
+route();
+</script>
+</body>
+</html>

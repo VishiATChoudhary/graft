@@ -215,6 +215,22 @@ gft review            # what the current change needs
 gft approve <rev>     # approvals are per changeset; authors cannot self-approve
 ```
 
+Change requests and the merge queue play the part of Scion's Antique. A
+change request proposes a changeset for a ref and collects revisions,
+line comments and approvals. Queuing it lands it as soon as its review
+rules are satisfied, with no one landing by hand; the land is the ordinary
+lock-free one, so queued requests do not wait on each other. The web UI is
+at `<server>/review` (diffs, inline comments, approve, queue), and the same
+operations are on the CLI:
+
+```sh
+gft cr create -m "why" [rev]     # open a change request for a changeset
+gft cr comment <id> --path f.go --line 12 "what about nil?"
+gft cr revise <id> [rev]         # push a new revision (approvals reset)
+gft cr queue <id>                # land when approved
+gft cr list                      # open change requests
+```
+
 See [docs/ACCESS.md](docs/ACCESS.md).
 
 ## HTTP API
@@ -230,6 +246,8 @@ Everything the CLI does is an API call to the server (`internal/api`):
 | `GET /v1/diff?from=&to=&mergebase=&path=&patch=` | file changes or a unified patch |
 | `GET /v1/grep?rev=&q=&path=&fixed=&i=` | content search |
 | `GET /v1/mergebase?a=&b=`, `/v1/isancestor` | ancestry |
+| `GET /v1/crs?state=`, `/v1/cr?id=`; `POST /v1/cr/{create,revise,comment,queue,close}` | change requests and the merge queue |
+| `GET /review` | review web UI |
 | `GET /v1/ls`, `/v1/cat`, `/v1/search` | trees, file content, path search |
 | `POST /v1/changesets`, `/v1/write` | create a changeset (from blob IDs or inline content) |
 | `POST /v1/rebase`, `/v1/merge`, `/v1/land`, `/v1/refs/update` | server-side rewrites and ref CAS |
@@ -240,8 +258,7 @@ Everything the CLI does is an API call to the server (`internal/api`):
 
 Version 0.1, tested with `go test -race ./...`, the repository suite against
 a 3-shard fleet, and `bench/smoke.sh`, which imports a real repository and
-cross-checks it against git. CI runs on Linux, macOS and Windows. Code
-review here means approval gates; there is no review UI.
+cross-checks it against git. CI runs on Linux, macOS and Windows.
 
 ## License
 

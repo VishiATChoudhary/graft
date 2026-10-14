@@ -139,6 +139,17 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/grep", s.wrap(s.grep))
 	mux.HandleFunc("/v1/reviews/approve", s.wrap(s.approveHandler))
 	mux.HandleFunc("/v1/reviews/status", s.wrap(s.reviewStatusHandler))
+	mux.HandleFunc("/v1/crs", s.wrap(s.crList))
+	mux.HandleFunc("/v1/cr", s.wrap(s.crGet))
+	mux.HandleFunc("/v1/cr/create", s.wrap(s.crCreate))
+	mux.HandleFunc("/v1/cr/revise", s.wrap(s.crRevise))
+	mux.HandleFunc("/v1/cr/comment", s.wrap(s.crComment))
+	mux.HandleFunc("/v1/cr/queue", s.wrap(s.crQueue))
+	mux.HandleFunc("/v1/cr/close", s.wrap(s.crClose))
+	mux.HandleFunc("/review", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(reviewUI)
+	})
 }
 
 func (s *Server) approveHandler(r *http.Request) (any, error) {
@@ -344,7 +355,16 @@ func (s *Server) info(r *http.Request) (any, error) {
 	return out, nil
 }
 
-func (s *Server) refs(r *http.Request) (any, error) { return s.Repo.Refs() }
+// refs lists refs, without server metadata (change request records).
+func (s *Server) refs(r *http.Request) (any, error) {
+	refs, err := s.Repo.Refs()
+	for name := range refs {
+		if strings.HasPrefix(name, "meta/") {
+			delete(refs, name)
+		}
+	}
+	return refs, err
+}
 
 func (s *Server) refUpdate(r *http.Request) (any, error) {
 	var u RefUpdate

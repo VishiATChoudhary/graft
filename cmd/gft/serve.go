@@ -93,6 +93,9 @@ func cmdServe(args []string) error {
 		if *peers != "" {
 			srv.Peers = strings.Split(*peers, ",")
 		}
+		// The merge queue lands queued change requests once approved
+		// (also on approvals made through other API servers).
+		srv.StartMergeQueue(context.Background(), 2*time.Second)
 		if *aclFile != "" {
 			pol, err := acl.Load(*aclFile)
 			if err != nil {

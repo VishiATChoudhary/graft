@@ -205,6 +205,24 @@ against a 3-shard fleet, land concurrently through three API servers, and
 kill the Raft leader and a data replica mid-workload (two shards x three
 replicas) checking that landing continues and nothing is lost.
 
+## Change requests and the merge queue (`internal/api/cr.go`)
+
+A change request's record (title, author, target ref, revisions, comments,
+state) is a JSON object in the store. The ref `meta/cr/<id>` names its
+newest version and moves by compare-and-swap; an update reads the newest
+version, applies its change and retries on a lost race, so comments made
+concurrently through different API servers are all kept, on every backend.
+`meta/` refs are hidden from ref listings and clones.
+
+Approvals remain per changeset (refs `reviews/<changeset>/<who>`), so a
+new revision needs its own. Queuing records the queuer after checking
+their write permission against the request's whole diff. Each server's
+queue pass (after queuing, after every approval, and every two seconds for
+approvals made elsewhere) lands every queued request whose rules are
+satisfied with the ordinary land; a conflict sends the request back to
+`open` with the conflicting paths, and missing approvals are shown as what
+the request is waiting for.
+
 ## Diff, merge and blame (`internal/diff`)
 
 graft's line diff ports git's xdiff: end trimming, discarding of lines that
@@ -257,9 +275,10 @@ renames are followed. Server-side merges use diff3.
   storage numbers apply to the pebble backends. Self-hosted alternative:
   pebble shards replicated by graft itself (majority writes, Raft for refs
   and the log), without automatic re-replication to new machines.
-* **Code review** is a set of approval gates with semantic exemptions and an
-  API, not a review UI like Antique. **Code search** is an unindexed parallel
-  scan.
+* **Code review** is graft's own: change requests with revisions, line
+  comments, semantic approval rules and a merge queue that lands approved
+  requests, with a web UI; Antique's details beyond what the post says are
+  not public. **Code search** is an unindexed parallel scan.
 * **Storage efficiency** is decided at write time; nothing ever needs
   repacking. `gft compact` is an optional pass (like `git gc --aggressive`)
   that re-deltas blobs against similar ones anywhere in history.
