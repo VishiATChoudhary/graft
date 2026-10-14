@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -254,8 +255,16 @@ func Dial(root string) *Client {
 		return nil
 	}
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		// The socket file appears at bind(), slightly before listen():
+		// retry briefly on a refused connection.
 		var d net.Dialer
-		return d.DialContext(ctx, "unix", sock)
+		for i := 0; ; i++ {
+			c, err := d.DialContext(ctx, "unix", sock)
+			if err == nil || i >= 50 || !errors.Is(err, syscall.ECONNREFUSED) {
+				return c, err
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}}
 	return &Client{http: &http.Client{Transport: tr, Timeout: 5 * time.Second}}
 }
