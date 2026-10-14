@@ -110,9 +110,8 @@ func (r *Repo) Create(cs *object.Changeset) (object.ID, error) {
 // append stores a pre-validated changeset.
 func (r *Repo) append(cs *object.Changeset) (object.ID, error) {
 	id, stored := object.Encode(object.KindChangeset, cs.Encode())
-	if _, err := r.DB.LogSeq(id); err == nil {
-		return id, nil // already in the log
-	}
+	// No "already logged?" lookup first: it would cost a round trip on
+	// every new changeset, and storing and appending are idempotent.
 	if err := r.DB.Put(id, stored); err != nil {
 		return object.Zero, err
 	}

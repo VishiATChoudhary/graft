@@ -322,6 +322,7 @@ func (r *Repo) landBatch(ref string, l *lander, batch []*landReq) {
 			}
 			return
 		}
+		r.prefetchLands(tip, batch)
 		cur := tip
 		var ok []*landReq
 		var results []*LandResult
@@ -369,6 +370,44 @@ func (r *Repo) landBatch(ref string, l *lander, batch []*landReq) {
 			batch = append(batch, q)
 		}
 	}
+}
+
+// prefetchLands reads, in parallel, what rebasing each request onto tip
+// will need (graph records, the stacked changesets, their base trees), so
+// the serial rebase chain inside a batch runs from cache. On a sharded
+// backend this turns a few sequential round trips per request into a
+// handful for the whole batch.
+func (r *Repo) prefetchLands(tip object.ID, batch []*landReq) {
+	if tip.IsZero() || len(batch) < 2 {
+		return
+	}
+	sem := make(chan struct{}, 32)
+	var wg sync.WaitGroup
+	for _, q := range batch {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(head object.ID) {
+			defer func() { <-sem; wg.Done() }()
+			stack, ok, err := r.stackOnto(head, tip)
+			if err != nil || !ok {
+				return
+			}
+			for _, id := range stack {
+				cs, err := r.Changeset(id)
+				if err != nil || len(cs.Parents) != 1 {
+					return
+				}
+				base, err := r.RootTree(cs.Parents[0])
+				if err != nil {
+					return
+				}
+				for _, ch := range cs.Changes {
+					r.fileAt(base, ch.Path)
+				}
+			}
+		}(q.head)
+	}
+	wg.Wait()
 }
 
 // landOnto computes the changeset that lands head on top of tip.

@@ -54,8 +54,10 @@ type Sharded struct {
 	// Write-behind for objects: PutBase returns once the write is queued;
 	// barrier() waits for every queued write before anything that can
 	// reference those objects is published (log, derived data, refs).
-	queued        sync.Map // ID -> stored bytes, until written
-	queuedDerived sync.Map // derivedKey -> value, until written
+	queued        sync.Map     // ID -> stored bytes, until written
+	byID          sync.Map     // ID -> *pendingWrite
+	queuedDerived sync.Map     // derivedKey -> value, until written
+	derivedN      atomic.Int64 // queued derived writes (Flush waits)
 	waiting       map[uint64]chan struct{}
 	ticket        uint64
 	pendMu        sync.Mutex
@@ -368,6 +370,8 @@ func (s *Sharded) PutBase(id object.ID, stored []byte, base object.ID) error {
 	s.hot.Put(id, stored) // readable by this server immediately
 	s.queued.Store(id, stored)
 	done := make(chan struct{})
+	pw := &pendingWrite{done: done}
+	s.byID.Store(id, pw)
 	s.pendMu.Lock()
 	s.ticket++
 	t := s.ticket
@@ -376,6 +380,10 @@ func (s *Sharded) PutBase(id object.ID, stored []byte, base object.ID) error {
 	s.inflight <- struct{}{}
 	go func() {
 		err := s.writeAll(s.replicas(id), "/kv/put", putFrame(id, base, stored))
+		pw.err = err
+		if err == nil { // failures stay visible to waitFor until rewritten
+			s.byID.CompareAndDelete(id, pw)
+		}
 		s.queued.Delete(id)
 		<-s.inflight
 		s.pendMu.Lock()
@@ -386,6 +394,25 @@ func (s *Sharded) PutBase(id object.ID, stored []byte, base object.ID) error {
 		s.pendMu.Unlock()
 		close(done)
 	}()
+	return nil
+}
+
+type pendingWrite struct {
+	done chan struct{}
+	err  error // set before done is closed
+}
+
+// waitFor waits for queued writes of the given objects only.
+func (s *Sharded) waitFor(ids ...object.ID) error {
+	for _, id := range ids {
+		if v, ok := s.byID.Load(id); ok {
+			pw := v.(*pendingWrite)
+			<-pw.done
+			if pw.err != nil {
+				return pw.err
+			}
+		}
+	}
 	return nil
 }
 
@@ -470,8 +497,9 @@ func (s *Sharded) cacheDerived(kind string, id object.ID, v []byte) {
 }
 
 // PutDerived is write-behind: the value is readable here at once and is
-// written once every object queued before it is stored (so derived data
-// never refers to objects not yet durable). Barriers wait for it too.
+// written after every object queued before it (so derived data never
+// refers to objects not yet durable). Derived data is a cache, so
+// publishing (log appends, ref updates) does not wait for it; Flush does.
 func (s *Sharded) PutDerived(kind string, id object.ID, v []byte) error {
 	s.cacheDerived(kind, id, v)
 	k := derivedKey{kind, id}
@@ -481,26 +509,17 @@ func (s *Sharded) PutDerived(kind string, id object.ID, v []byte) error {
 	for _, c := range s.waiting {
 		prior = append(prior, c)
 	}
-	done := make(chan struct{})
-	s.ticket++
-	t := s.ticket
-	s.waiting[t] = done
 	s.pendMu.Unlock()
+	s.derivedN.Add(1)
 	go func() {
+		defer s.derivedN.Add(-1)
 		for _, c := range prior {
 			<-c
 		}
 		s.inflight <- struct{}{}
-		err := s.writeAll(s.replicas(id), "/kv/derived/put?kind="+kind, derivedFrame(id, v))
+		s.writeAll(s.replicas(id), "/kv/derived/put?kind="+kind, derivedFrame(id, v))
 		<-s.inflight
 		s.queuedDerived.Delete(k)
-		s.pendMu.Lock()
-		if err != nil && s.pendErr == nil {
-			s.pendErr = err
-		}
-		delete(s.waiting, t)
-		s.pendMu.Unlock()
-		close(done)
 	}()
 	return nil
 }
@@ -515,10 +534,10 @@ func (s *Sharded) GetRef(name string) (object.ID, error) {
 	return id, nil
 }
 
+// CASRef needs no write barrier: a ref names a changeset, and changesets
+// are only logged (which the repository checks before any ref update)
+// after their contents are durable.
 func (s *Sharded) CASRef(name string, old, new object.ID) error {
-	if err := s.barrier(); err != nil {
-		return err
-	}
 	b, _ := json.Marshal(struct {
 		Name     string
 		Old, New object.ID
@@ -544,8 +563,23 @@ func (s *Sharded) ListRefs() (map[string]object.ID, error) {
 	return out, json.Unmarshal(body, &out)
 }
 
+// AppendLog publishes a changeset in the log once the changeset and its
+// blobs are durable (trees are derived data; parents are already logged).
+// It waits only for those writes, not for unrelated concurrent requests.
 func (s *Sharded) AppendLog(id object.ID) (uint64, error) {
-	if err := s.barrier(); err != nil {
+	deps := []object.ID{id}
+	if v, ok := s.queued.Load(id); ok {
+		if _, p, err := object.Unpack(v.([]byte)); err == nil {
+			if cs, err := object.DecodeChangeset(p); err == nil {
+				for _, ch := range cs.Changes {
+					if !ch.Blob.IsZero() {
+						deps = append(deps, ch.Blob)
+					}
+				}
+			}
+		}
+	}
+	if err := s.waitFor(deps...); err != nil {
 		return 0, err
 	}
 	body, _, err := s.meta("POST", "/kv/log/append", id[:])
@@ -649,6 +683,9 @@ func (s *Sharded) Stats() map[string]any {
 func (s *Sharded) Flush() error {
 	if err := s.barrier(); err != nil {
 		return err
+	}
+	for s.derivedN.Load() > 0 {
+		time.Sleep(time.Millisecond)
 	}
 	for _, reps := range s.shards {
 		for _, u := range reps {
