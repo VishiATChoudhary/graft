@@ -378,16 +378,27 @@ func (r *Repo) ReadBlob(id object.ID) ([]byte, error) {
 }
 
 // FindPaths returns up to limit file paths under dir whose path contains q
-// (case-insensitive), walking the tree server-side.
+// (case-insensitive), walking the tree server-side and skipping subtrees
+// the path index (pathindex.go) rules out.
 func (r *Repo) FindPaths(root object.ID, dir, q string, limit int) ([]string, error) {
 	e, err := r.Lookup(root, dir)
 	if err != nil {
 		return nil, err
 	}
 	q = strings.ToLower(q)
+	tris := pathQueryTrigrams(q)
 	var out []string
-	var walk func(prefix string, id object.ID) error
-	walk = func(prefix string, id object.ID) error {
+	var walk func(prefix string, id object.ID, matched bool) error
+	walk = func(prefix string, id object.ID, matched bool) error {
+		if !matched && len(tris) > 0 {
+			set, err := r.nameTrigrams(id)
+			if err != nil {
+				return err
+			}
+			if !containsAll(set, tris) {
+				return nil
+			}
+		}
 		t, err := store.ReadTree(r.DB, id)
 		if err != nil {
 			return err
@@ -398,7 +409,9 @@ func (r *Repo) FindPaths(root object.ID, dir, q string, limit int) ([]string, er
 			}
 			p := join(prefix, en.Name)
 			if en.Mode == object.ModeDir {
-				if err := walk(p, en.ID); err != nil {
+				// Once a directory name contains q, everything below matches.
+				m := matched || (len(tris) > 0 && strings.Contains(strings.ToLower(en.Name), q))
+				if err := walk(p, en.ID, m); err != nil {
 					return err
 				}
 			} else if strings.Contains(strings.ToLower(p), q) {
@@ -413,5 +426,6 @@ func (r *Repo) FindPaths(root object.ID, dir, q string, limit int) ([]string, er
 	if e.ID.IsZero() {
 		return nil, nil
 	}
-	return out, walk(strings.Trim(dir, "/"), e.ID)
+	prefix := strings.Trim(dir, "/")
+	return out, walk(prefix, e.ID, len(tris) > 0 && strings.Contains(strings.ToLower(prefix), q))
 }

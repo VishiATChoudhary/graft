@@ -222,6 +222,13 @@ skipped, so results equal a full scan (tested). On the 100k-file monorepo
 selective searches take 11 to 24 ms against about 400 ms for a full scan;
 the filters for a whole revision take about 4% of the repository's size.
 
+Path search (`FindPaths`, `pathindex.go`) has its own index: each tree's
+exact set of trigrams of every entry name in its subtree, built bottom-up
+from its children's sets. A query without "/" lies inside one path
+component, so a subtree lacking one of its trigrams is skipped unless an
+enclosing directory's name already matches. Tested against matching every
+path; selective path queries on the monorepo go from about 7 ms to 0 to 2 ms.
+
 ## Change requests and the merge queue (`internal/api/cr.go`)
 
 A change request's record (title, author, target ref, revisions, comments,
