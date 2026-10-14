@@ -24,6 +24,8 @@ import (
 // replica's store. Reads that must be current go through the leader.
 type MetaGroup struct {
 	r      *raft.Raft
+	logs   *raftboltdb.BoltStore
+	trans  *raft.NetworkTransport
 	db     *DB
 	byAddr map[raft.ServerAddress]string // raft address -> HTTP URL
 }
@@ -224,15 +226,24 @@ func OpenMetaGroup(db *DB, cfg MetaConfig) (*MetaGroup, error) {
 			return nil, err
 		}
 	}
-	m := &MetaGroup{r: r, db: db, byAddr: map[raft.ServerAddress]string{}}
+	m := &MetaGroup{r: r, logs: logs, trans: trans, db: db, byAddr: map[raft.ServerAddress]string{}}
 	for i, a := range cfg.RaftAddr {
 		m.byAddr[raft.ServerAddress(a)] = cfg.HTTP[i]
 	}
 	return m, nil
 }
 
-// Close stops the replica.
-func (m *MetaGroup) Close() error { return m.r.Shutdown().Error() }
+// Close stops the replica and releases its files and listener.
+func (m *MetaGroup) Close() error {
+	err := m.r.Shutdown().Error()
+	if cerr := m.trans.Close(); err == nil {
+		err = cerr
+	}
+	if cerr := m.logs.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 func (m *MetaGroup) notLeader() error {
 	addr, _ := m.r.LeaderWithID()
