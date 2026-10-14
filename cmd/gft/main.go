@@ -172,7 +172,8 @@ func main() {
 	}
 }
 
-const version = "0.1.0"
+// version is set by release builds (-ldflags "-X main.version=...").
+var version = "0.1.0-dev"
 
 // parse parses flags interspersed with positional arguments.
 func parse(fs *flag.FlagSet, args []string) []string {

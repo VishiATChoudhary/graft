@@ -37,6 +37,11 @@ packfiles, mirrors, negotiation CPU and merge-queue contention. graft drops it:
 
 [docs/DESIGN.md](docs/DESIGN.md) maps each part of the post to code.
 
+
+Prebuilt binaries for Linux, macOS and Windows are on the
+[releases page](https://github.com/VishiATChoudhary/graft/releases/latest),
+or `go install github.com/VishiATChoudhary/graft/cmd/gft@latest`.
+
 ## Results vs git
 
 Synthetic agent-scale monorepo: 100,000 files, 20,001 commits of small agent

@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - {os: ubuntu-latest, goos: linux, goarch: amd64}
+          - {os: ubuntu-latest, goos: linux, goarch: arm64}
+          - {os: ubuntu-latest, goos: windows, goarch: amd64}
+          - {os: ubuntu-latest, goos: windows, goarch: arm64}
+          - {os: macos-latest, goos: darwin, goarch: arm64, cc: "clang -arch arm64"}
+          - {os: macos-latest, goos: darwin, goarch: amd64, cc: "clang -arch x86_64"}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          # macOS needs cgo for FSEvents; elsewhere builds are static.
+          if [ "$GOOS" = darwin ]; then export CGO_ENABLED=1 CC="${{ matrix.cc }}"; else export CGO_ENABLED=0; fi
+          ext=""; [ "$GOOS" = windows ] && ext=.exe
+          v="${GITHUB_REF_NAME#v}"
+          name="gft_${v}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/$name"
+          go build -trimpath -ldflags "-s -w -X main.version=$v" -o "dist/$name/gft$ext" ./cmd/gft
+          go build -trimpath -tags cloud -ldflags "-s -w -X main.version=$v" -o "dist/$name/gft-cloud$ext" ./cmd/gft
+          cp LICENSE README.md "dist/$name/"
+          cd dist
+          if [ "$GOOS" = windows ]; then zip -qr "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > checksums.txt
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "graft $GITHUB_REF_NAME" \
+            --notes-file ../.github/release-notes.md *
