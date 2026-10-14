@@ -214,9 +214,17 @@ renames are followed. Server-side merges use diff3.
 
 ## Where graft differs from the post
 
-* **Storage backend.** Shards are pebble stores replicated by graft itself
-  (majority writes, Raft for refs and the log), not Spanner. There is no
-  automatic re-replication to new machines or cross-region placement.
+* **Storage backend.** `gft serve --spanner projects/P/instances/I/databases/D`
+  runs stateless API servers directly on Cloud Spanner, as Scion does:
+  objects and derived data are rows, ref CAS is a single conditional
+  statement, log sequences are assigned in read-write transactions, and
+  Spanner provides replication, failover and scaling. CI runs the full
+  repository suite against it (in-memory `spannertest`); it has not been run
+  against a production Spanner instance. Spanner rows hold each object's
+  standard compressed form, without graft's delta encodings, so the dense
+  storage numbers apply to the pebble backends. Self-hosted alternative:
+  pebble shards replicated by graft itself (majority writes, Raft for refs
+  and the log), without automatic re-replication to new machines.
 * **Code review** is a set of approval gates with semantic exemptions and an
   API, not a review UI like Antique. **Code search** is an unindexed parallel
   scan.

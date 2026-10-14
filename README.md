@@ -150,6 +150,13 @@ gft serve --tier server --store $NODES --listen :7070                           
 gft import --store $NODES --git ~/src/myrepo
 ```
 
+On Google Cloud, point API servers at Spanner instead, the backend Scion
+uses (`--spanner-init` creates the tables once):
+
+```sh
+gft serve --spanner projects/P/instances/I/databases/graft --spanner-init --listen :7500
+```
+
 Each shard can be a replica set: list replicas with `|`. Data is written to
 a majority of a shard's replicas and read with failover. Shard 0's replicas
 run Raft for refs and the changeset log, so losing the leader triggers an

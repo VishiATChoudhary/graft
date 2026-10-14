@@ -30,6 +30,8 @@ import (
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	tier := fs.String("tier", "server", "server | cache | daemon | store")
+	spannerDB := fs.String("spanner", "", "server: Cloud Spanner database projects/P/instances/I/databases/D (stateless API server)")
+	spannerInit := fs.Bool("spanner-init", false, "server: create graft's tables in the --spanner database first")
 	storeNodes := fs.String("store", "", "server: comma-separated storage nodes (stateless API server); omit to use --data")
 	shard := fs.Int("shard", 0, "store: this node's shard index in --nodes")
 	replica := fs.Int("replica", 0, "store: this node's replica index within its shard")
@@ -53,6 +55,20 @@ func cmdServe(args []string) error {
 	case "server":
 		var backend store.Backend
 		switch {
+		case *spannerDB != "":
+			// Stateless API server on Spanner, as in Scion; run as many as needed.
+			ctx := context.Background()
+			if *spannerInit {
+				if err := store.CreateSpannerSchema(ctx, *spannerDB); err != nil {
+					return err
+				}
+			}
+			sp, err := store.OpenSpanner(ctx, *spannerDB, mustSize(*mem))
+			if err != nil {
+				return err
+			}
+			closeFn = func() { sp.Close() }
+			backend = sp
 		case *storeNodes != "":
 			// Stateless API server over a storage fleet; run as many as needed.
 			backend = store.NewSharded(strings.Split(*storeNodes, ","), mustSize(*mem))
@@ -64,7 +80,7 @@ func cmdServe(args []string) error {
 			closeFn = func() { db.Close() }
 			backend = db
 		default:
-			return errors.New("the server tier needs --data (single node) or --store (storage fleet)")
+			return errors.New("the server tier needs --data (single node), --store (storage fleet) or --spanner")
 		}
 		r, err := repo.Open(backend)
 		if err != nil {

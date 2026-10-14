@@ -30,6 +30,14 @@ func newBackend(t *testing.T) store.Backend {
 	if n, _ := strconv.Atoi(os.Getenv("GRAFT_TEST_SHARDS")); n > 0 {
 		return newFleet(t, n)
 	}
+	if os.Getenv("GRAFT_TEST_SPANNER") != "" {
+		s, closeFn, err := store.OpenFakeSpanner()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(closeFn)
+		return s
+	}
 	db, err := store.OpenDB(t.TempDir(), 64<<20)
 	if err != nil {
 		t.Fatal(err)

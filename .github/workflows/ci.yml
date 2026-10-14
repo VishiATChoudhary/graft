@@ -26,6 +26,9 @@ jobs:
       - name: repository tests against a 3-shard storage fleet
         if: runner.os != 'Windows'
         run: GRAFT_TEST_SHARDS=3 go test -race ./internal/repo/
+      - name: repository tests against Cloud Spanner (in-memory spannertest)
+        if: runner.os != 'Windows'
+        run: GRAFT_TEST_SPANNER=1 go test -race ./internal/repo/
       - run: go build -o bin/gft ./cmd/gft
       - name: smoke test against git
         if: runner.os != 'Windows'
